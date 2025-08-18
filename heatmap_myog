@@ -1,0 +1,38 @@
+library(pheatmap)
+library(RColorBrewer)
+
+# Suppose myog_drivers_table has columns: Patient, Gene
+# Create a binary matrix for annotation: Patients x Genes
+patients <- unique(myog_drivers_table$Patient)
+genes <- unique(myog_drivers_table$Gene)
+
+mut_mat <- matrix(0, nrow = length(genes), ncol = length(patients),
+                  dimnames = list(genes, patients))
+
+# Fill matrix: 1 if mutation exists
+for(i in 1:nrow(myog_drivers_table)){
+  mut_mat[myog_drivers_table$Gene[i], myog_drivers_table$Patient[i]] <- 1
+}
+
+# Transpose so patients are rows for annotation
+annotation_col <- as.data.frame(t(mut_mat))
+annotation_col[] <- lapply(annotation_col, factor) # convert to factor for coloring
+
+# Create colors for mutations
+ann_colors <- list()
+for(gene in genes){
+  ann_colors[[gene]] <- c("0" = "white", "1" = "black") # white=no mutation, black=mutation
+}
+
+# Plot heatmap with annotation
+pheatmap(
+  log_mat,
+  scale = "row",
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  show_colnames = FALSE # remove x-axis labels
+)
