@@ -1,0 +1,16 @@
+path_genes_vol <- function(ranks_df, path, colour){
+  ranks_df <- ranks_df %>%
+    mutate(in_path = gene %in% pathways[[path]])
+  
+  ranks_df_sig <- subset(ranks_df, ranks_df$FDR < 0.05)
+  
+  p <- ggplot(ranks_df, aes(x = logFC, y = -log10(FDR))) +
+    geom_point(alpha = 0.3) +
+    geom_point(data = subset(ranks_df_sig, in_path), color = colour, alpha = 0.8) +
+    # geom_point(data = subset(ranks_df_sig, in_path_down), color = "blue", alpha = 0.8) +
+    theme_minimal() +
+    labs(title = paste("Volcano plot with genes from", path ,"highlighted"),
+         x = "Log2 Fold Change", y = "-log10(P value)")
+  plot(p)
+  return(ranks_df)
+}
