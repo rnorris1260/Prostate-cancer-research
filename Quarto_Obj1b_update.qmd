@@ -1,0 +1,1802 @@
+---
+title: "AECC Talent Objective 1"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(edgeR)
+library(ggrepel)
+library(fgsea)
+library(msigdbr)
+library(edgeR)
+library(GSVA)
+```
+
+Read in RNA data, normalise and identify any outliers
+
+```{r}
+# Read raw count data
+counts <- read.csv("~/HMF/gene_counts_from_fittedfragments/HMF_rna_counts.csv")
+rownames(counts) <- counts$X
+counts <- counts[-1]
+```
+
+```{r}
+```
+
+Tumour purity is extremely heterogeneous so we need to normalise the data by this metric before we do anything else
+
+```{r}
+## Patients
+pats <- colnames(counts)
+```
+```{r}
+```
+
+```{r}
+library(readr)
+
+metadata <- readr::read_tsv(
+  "~/HMF/metadata/metadata.csv",      # even if it’s .csv, it’s actually TSV per your sep
+  locale = readr::locale(encoding = "UTF-8"),
+  trim_ws = TRUE,
+  na = c("", "NA"),
+  show_col_types = FALSE,
+  guess_max = 100000
+)
+
+# Strip UTF-8 BOM if present on the first name
+names(metadata) <- sub("^\ufeff", "", names(metadata))
+
+# Don’t let R “fix” names behind your back
+# (readr already keeps names as-is; for base readers you’d also set check.names = FALSE)
+
+names(metadata)[1] <- "patient_id"
+
+# Optional sanity checks
+if (anyNA(metadata$patient_id)) warning("Some patient_id values are NA")
+if (any(duplicated(metadata$patient_id))) warning("Duplicate patient_id values found")
+
+```
+
+
+```{r}
+# Ensure order of metadata matches count data columns
+#metadata <- metadata[metadata$patient_Id %in% colnames(counts), ]
+# metadata_purity <- data.frame("patientID" = metadata$sampleId, "batch" = metadata$tumorPurity)
+# metadata_purity$purity_scaled <- scale(metadata_purity$batch, center = TRUE, scale = TRUE)
+# batch
+#batch <- metadata_purity$batch
+# edit treatment column
+
+metadata <- data.frame(lapply(metadata, function(x) {
+                  gsub("yes", "Yes", x)
+              }))
+
+metadata <- data.frame(lapply(metadata, function(x) {
+                  gsub("null", "No", x)
+              }))
+
+metadata$treatmentGiven <- as.factor(metadata$treatmentGiven)
+```
+
+1.  **Log Transformation:**
+
+    Apply the log transformation to address skewness or a log-normal distribution. 
+
+2.  **Z-Score Standardization:**
+
+    After log transformation, standardize the data to have a mean of 0 and a standard deviation of 1, giving all variables similar scales. 
+
+```{r}
+suppressPackageStartupMessages({
+  library(edgeR); library(ggplot2); library(dplyr); library(matrixStats)
+})
+
+prep_pca_matrix <- function(counts, group = NULL, top_var = 5000) {
+  y <- DGEList(counts)
+  keep <- filterByExpr(y, group = group)
+  y <- y[keep, , keep.lib.sizes = FALSE]
+  y <- calcNormFactors(y, method = "TMM")
+  expr <- log1p(cpm(y, log = FALSE))
+  if (!is.null(top_var) && nrow(expr) > top_var) {
+    expr <- expr[order(rowVars(expr), decreasing = TRUE)[seq_len(top_var)], , drop = FALSE]
+  }
+  z <- t(scale(t(expr), center = TRUE, scale = TRUE)); z[!is.finite(z)] <- 0
+  list(z = z, dge = y)
+}
+```
+
+```{r}
+pca_plot_no_labels <- function(z, metadata, sample_col = "patient_id",
+                               color_by = "biopsy_site", shape_by = "batch", size_by = "purity") {
+  #stopifnot(all(colnames(z) %in% metadata[[sample_col]]))
+  md <- metadata[match(colnames(z), metadata[[sample_col]]), , drop = FALSE]
+  pr <- prcomp(t(z), center = FALSE, scale. = FALSE)
+  var_exp <- pr$sdev^2 / sum(pr$sdev^2)
+  df <- cbind(md, as.data.frame(pr$x[, 1:2, drop = FALSE]))
+  
+  aes_map <- aes(PC1, PC2, color = .data[[color_by]])
+  if (!is.null(shape_by) && shape_by %in% names(df)) aes_map$shape <- as.name(shape_by)
+  if (!is.null(size_by)  && size_by  %in% names(df)) aes_map$size  <- as.name(size_by)
+  
+  ggplot(df, aes_map) +
+    geom_point(alpha = 0.9) +
+    geom_hline(yintercept = 0, linetype = 3) +
+    geom_vline(xintercept = 0, linetype = 3) +
+    labs(
+      title = "PCA (TMM→CPM→log1p)",
+      x = sprintf("PC1 (%.1f%%)", 100*var_exp[1]),
+      y = sprintf("PC2 (%.1f%%)", 100*var_exp[2]),
+      color = color_by, shape = shape_by, size = size_by
+    ) +
+    theme_minimal(base_size = 12)
+}
+```
+
+```{r}
+pp  <- prep_pca_matrix(counts, group = metadata$group)
+p   <- pca_plot_no_labels(pp$z, metadata,
+                          sample_col = "patient_id",
+                          color_by   = "treatmentGiven",
+                          shape_by   = "batch",
+                          size_by    = "purity")
+```
+
+```{r}
+print(p)
+```
+
+![](images/clipboard-2539245339.png)
+
+Normalisation of count data with **edgeR** and prepare for **single sample GSEA**
+
+```{r}
+# Human Hallmark gene sets
+library(msigdbr)
+m_df <- msigdbr(species = "Homo sapiens", collection = "H")  # H = Hallmark
+pathways <- split(m_df$gene_symbol, m_df$gs_name)
+```
+
+```{r}
+# counts: genes x samples (integers)
+# genesets: a list of character vectors (or a GeneSetCollection)
+# Example to read a GMT:
+# genesets <- getGmt("path/to/your.gmt")
+
+# Normalize (TMM) and make log1p-CPM for ssGSEA
+y <- DGEList(counts)
+y <- calcNormFactors(y, method = "TMM")
+expr_for_ssgsea <- log1p(cpm(y, log = FALSE))  # NOT z-scored
+```
+
+```{r}
+## Build the ssGSEA parameter object (note: no 'kcdf' here)
+par_ssgsea <- ssgseaParam(
+  exprData = expr_for_ssgsea,
+  geneSets = pathways,
+  minSize  = 5,
+  maxSize  = 5000,
+  alpha    = 0.25,   # tail weight (Barbie et al. 2009)
+  normalize = TRUE   # same as old ssgsea.norm=TRUE
+) 
+```
+
+```{r}
+## Run ssGSEA
+scores <- gsva(par_ssgsea, verbose = FALSE) 
+```
+
+```{r}
+### plot GSEA
+library(pheatmap) 
+hp <- pheatmap(scores,
+         scale = "row",                  # z-score each pathway
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         show_rownames = T,
+         show_colnames = FALSE) 
+```
+
+![](images/clipboard-3149346738.png)
+
+Analyse ssGSEA output 1
+
+Look at top pathways
+
+```{r}
+suppressPackageStartupMessages({
+  library(matrixStats)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(dplyr)
+}) 
+
+plot_ssgsea_topvar_heatmap <- function(ssgsea_scores,
+                                       metadata = NULL,
+                                       sample_col = "patient_id",
+                                       group_col  = NULL,
+                                       top_n = 30) {
+  #stopifnot(all(colnames(ssgsea_scores) %in% metadata[[sample_col]]))
+  # order metadata to match columns
+  md <- metadata[match(colnames(ssgsea_scores), metadata[[sample_col]]), , drop = FALSE]
+
+  # select top pathways by across-sample variance
+  v <- rowVars(as.matrix(ssgsea_scores))
+  keep <- order(v, decreasing = TRUE)[seq_len(min(top_n, length(v)))]
+  mat  <- ssgsea_scores[keep, , drop = FALSE]
+
+  # z-score per pathway for visualization (do NOT z-score for the ssGSEA calculation itself)
+  mat_z <- t(scale(t(mat)))
+  mat_z[!is.finite(mat_z)] <- 0
+
+  # optional top annotation
+  ha <- NULL
+  if (!is.null(group_col) && group_col %in% names(md)) {
+    grp <- factor(md[[group_col]])
+    pal <- structure(scales::hue_pal()(nlevels(grp)), names = levels(grp))
+    ha  <- HeatmapAnnotation(Cluster = grp, col = list(Cluster = pal))
+  }
+
+  Heatmap(
+    mat_z,
+    name = "ssGSEA z",
+    top_annotation = ha,
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    column_title = sprintf("Top %d pathways by variance", nrow(mat_z)),
+    col = colorRamp2(c(-2, 0, 2), c("#313695", "#ffffbf", "#a50026"))
+  )
+}
+```
+
+```{r}
+# usage
+draw(plot_ssgsea_topvar_heatmap(scores, metadata, "patient_id", "cluster", top_n = 15)) 
+```
+
+Analyse ssGSEA output 2
+
+Quantify how each driver mutation shifts pathway activity by modeling **ssGSEA scores (pathways × samples)** against **mutation status (Mut vs WT)**, while adjusting for purity/batch/etc.
+
+```{r}
+drivers <- read.csv("~/HMF/drivers.csv")
+
+## genes that appear in the drivers csv file but are not linked to prostate cancer
+
+non_PCA_drivers <- c(
+  "AFDN",    # leukemia fusion partner
+  "CRLF2",   # B-ALL
+  "CSF3R",   # myeloid neoplasms
+  "TG",      # thyroid
+  "TSHR",    # thyroid
+  "IL1RAPL1",
+  "CD79A", "CD79B",   # B-cell
+  "MPL",              # MPN
+  "HNF1A",            # liver/diabetes, not PCa driver
+  "PRDM1", "RUNX1",   # lymphoma/leukemia
+  "ZFP36L2",
+  "OR4F21", "OR4N2",   # olfactory receptors; no PCa driver role
+  "C21orf91",
+  "MYOD1",
+  "SGCZ",
+  "PDYN",
+  "GATA1",
+  "KCNJ5",
+  "PAX5",
+  "BTK",
+  "JAK2",
+  "CARD11",
+  "ZRSR2",
+  "NTRK3",            # actionable fusion target but vanishingly rare in PCa
+  "IMMP2L",
+  "EYS",
+  "RYR1",
+  "PUDP",
+  "STS",
+  "TENM1",
+  "DIAPH2",
+  "LMBRD2",
+  "DOCK8"
+)
+
+# let's remove these from the drivevrs list
+driver_genes <- unique(drivers$gene)
+PCa_drivers <- setdiff(driver_genes, non_PCA_drivers)
+drivers_pca <- subset(drivers, drivers$gene %in% PCa_drivers)
+
+## Prostate core TSGs where CN loss is a clear driver mechanism
+pc_core_tsg <- intersect(driver_genes, c(
+  "PTEN","RB1","TP53",
+  "BRCA2","BRCA1",
+  "CDK12","CHD1","ATM",
+  "SMAD4","CDKN1B",
+  "WWOX","PPP2R2A"
+))
+
+## Haploinsufficient / arm-loss style candidates (treat strong het loss as relevant)
+pc_haplo_tsg <- intersect(driver_genes, c(
+  "PPP2R2A","WWOX","NKX3-1","RNASEH2B"  # add NKX3-1, RNASEH2B if present in future sets
+))
+
+## Oncogenes where amplifications are key in prostate
+pc_onc_amp <- intersect(driver_genes, c(
+  "AR","MYC",
+  "CCND1","CCNE1",
+  "ERBB2","FGFR1",
+  "MCL1","EGFR",
+  "NAALADL2","TOP2A"
+))
+
+## Prostate-relevant non-CN primary drivers (mainly SNV/fusion)
+## We keep them in matrix (so rows exist) but don't force CN logic.
+pc_other_relevant <- intersect(driver_genes, c(
+  "SPOP","FOXA1","ERG","TMPRSS2",
+  "EZH2","AKT1","PIK3CA","PIK3R1",
+  "KMT2C","KMT2D","ARID1A","ARID1B",
+  "STAG2","MED12","ZFHX3","FOXP1"
+))
+
+
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(purrr)
+  library(stringr)
+})
+
+## 1) CNV classifier (unchanged logic; returns 0/1/2/3/4) ----
+
+classify_pc_cnv_gene <- function(gene, minCN, maxCN, ploidy,
+                                 lof_genes = character(0)) {
+  if (is.na(minCN) && is.na(maxCN)) return(0L)
+  if (is.na(ploidy) || ploidy <= 0) ploidy <- 2
+  
+  minCN <- ifelse(is.na(minCN), maxCN, minCN)
+  maxCN <- ifelse(is.na(maxCN), minCN, maxCN)
+  
+  pc_core_tsg <- c("PTEN","RB1","TP53","BRCA2","BRCA1",
+                   "CDK12","CHD1","ATM","SMAD4","CDKN1B")
+  pc_haplo_tsg <- c("PPP2R2A","WWOX")
+  pc_onc_amp <- c("AR","MYC","CCND1","CCNE1",
+                  "ERBB2","FGFR1","MCL1","NAALADL2","TOP2A")
+  
+  is_core   <- gene %in% pc_core_tsg
+  is_haplo  <- gene %in% pc_haplo_tsg
+  is_onc    <- gene %in% pc_onc_amp
+  has_lof   <- gene %in% lof_genes
+  
+  cls <- 0L
+  
+  ## TSGs: deletions / biallelic
+  if (is_core || is_haplo) {
+    # Homozygous deletion
+    if (!is.na(minCN) && minCN < 0.5) {
+      return(2L)
+    }
+    # Biallelic via LOF + strong loss
+    if (!is.na(minCN) && minCN < 1.1 && has_lof) {
+      return(2L)
+    }
+    # Strong het loss
+    if (!is.na(minCN) && minCN >= 0.5 && minCN < 1.1) {
+      return(1L)
+    }
+  }
+  
+  ## Oncogenes: gains / amps
+  if (is_onc) {
+    # High-level amp
+    if (!is.na(maxCN) && maxCN >= 3 * ploidy) {
+      return(4L)
+    }
+    # Low-level gain
+    if (!is.na(maxCN) && maxCN >= (ploidy + 1)) {
+      cls <- max(cls, 3L)
+    }
+  }
+  
+  return(cls)
+}
+
+
+## 2) Helpers for ploidy + LOF ----
+
+read_purple_ploidy <- function(purity_file) {
+  if (!file.exists(purity_file)) return(NA_real_)
+  pdat <- suppressMessages(read_tsv(purity_file, show_col_types = FALSE))
+  as.numeric(pdat$ploidy[1])
+}
+
+get_lof_genes <- function(driver_catalog_file) {
+  if (!file.exists(driver_catalog_file)) return(character(0))
+  dc <- suppressMessages(read_tsv(driver_catalog_file, show_col_types = FALSE))
+  
+  lof_keywords <- c(
+    "frameshift","nonsense","splice","stop_gained","start_lost",
+    "deleterious","biallelic"
+  )
+  
+  dc %>%
+    mutate(across(everything(), as.character)) %>%
+    filter(if_any(everything(), ~ str_detect(tolower(.x), paste(lof_keywords, collapse="|")))) %>%
+    pull(gene) %>%
+    unique()
+}
+
+
+
+## 3) Main: build dataframe with PURPLE schema + CN fields ----
+build_pc_driver_dataframe <- function(sample_ids,
+                                      base_dir,
+                                      driver_genes) {
+  
+  driver_genes <- sort(unique(driver_genes))
+  
+  per_sample <- lapply(sample_ids, function(sid) {
+    driver_file <- file.path(base_dir, sid, "purple",
+                             paste0(sid, ".purple.driver.catalog.somatic.tsv"))
+    cnv_file    <- file.path(base_dir, sid, "purple",
+                             paste0(sid, ".purple.cnv.gene.tsv"))
+    purity_file <- file.path(base_dir, sid, "purple",
+                             paste0(sid, ".purple.purity.tsv"))
+    
+    if (!file.exists(driver_file) || !file.exists(cnv_file)) {
+      warning("Missing PURPLE files for ", sid)
+      return(NULL)
+    }
+    
+    drv      <- suppressMessages(read_tsv(driver_file, show_col_types = FALSE))
+    cnv      <- suppressMessages(read_tsv(cnv_file,    show_col_types = FALSE))
+    ploidy   <- read_purple_ploidy(purity_file)
+    lof_genes <- get_lof_genes(driver_file)
+    
+    ## Summarise CNV per gene
+    cnv_gene <- cnv %>%
+      filter(gene %in% driver_genes) %>%
+      group_by(gene) %>%
+      summarise(
+        cnv_minCopyNumber = suppressWarnings(
+          min(as.numeric(minCopyNumber), na.rm = TRUE)
+        ),
+        cnv_maxCopyNumber = suppressWarnings(
+          max(as.numeric(maxCopyNumber), na.rm = TRUE)
+        ),
+        .groups = "drop"
+      )
+    
+    ## Full join to allow genes present only in CNV or only in driver file
+    merged <- drv %>%
+      filter(gene %in% driver_genes) %>%
+      full_join(cnv_gene, by = "gene") %>%
+      mutate(
+        patient_id = sid,
+        # enforce numeric for CN columns
+        minCopyNumber = suppressWarnings(as.numeric(minCopyNumber)),
+        maxCopyNumber = suppressWarnings(as.numeric(maxCopyNumber)),
+        cnv_minCopyNumber = suppressWarnings(as.numeric(cnv_minCopyNumber)),
+        cnv_maxCopyNumber = suppressWarnings(as.numeric(cnv_maxCopyNumber)),
+        # fill missing CN from cnv_gene summary
+        minCopyNumber = dplyr::coalesce(minCopyNumber, cnv_minCopyNumber),
+        maxCopyNumber = dplyr::coalesce(maxCopyNumber, cnv_maxCopyNumber)
+      ) %>%
+      select(-cnv_minCopyNumber, -cnv_maxCopyNumber)
+    
+    ## Compute CN-based fields
+    merged <- merged %>%
+      rowwise() %>%
+      mutate(
+        driver_CN_likelihood = classify_pc_cnv_gene(
+          gene,
+          minCN = minCopyNumber,
+          maxCN = maxCopyNumber,
+          ploidy = ploidy,
+          lof_genes = lof_genes
+        ),
+        driver_CN_category = case_when(
+          driver_CN_likelihood == 2L ~ "homdel_or_biallelic",
+          driver_CN_likelihood == 1L ~ "het_loss_strong",
+          driver_CN_likelihood == 4L ~ "amp_high",
+          driver_CN_likelihood == 3L ~ "gain_low",
+          TRUE                       ~ "none"
+        ),
+        driver_CN = driver_CN_likelihood >= 1L
+      ) %>%
+      ungroup()
+    
+    ## Standardise column types BEFORE returning (prevents bind_rows type conflicts)
+    out <- merged %>%
+      mutate(
+        chromosome       = as.character(chromosome),
+        chromosomeBand   = as.character(chromosomeBand),
+        gene             = as.character(gene),
+        transcript       = as.character(transcript),
+        isCanonical      = as.logical(isCanonical),
+        driver           = as.logical(driver),
+        category         = as.character(category),
+        likelihoodMethod = as.character(likelihoodMethod),
+        driverLikelihood = suppressWarnings(as.numeric(driverLikelihood)),
+        missense         = suppressWarnings(as.integer(missense)),
+        nonsense         = suppressWarnings(as.integer(nonsense)),
+        splice           = suppressWarnings(as.integer(splice)),
+        inframe          = suppressWarnings(as.integer(inframe)),
+        frameshift       = suppressWarnings(as.integer(frameshift)),
+        biallelic        = as.logical(biallelic),
+        minCopyNumber    = suppressWarnings(as.numeric(minCopyNumber)),
+        maxCopyNumber    = suppressWarnings(as.numeric(maxCopyNumber)),
+        patient_id       = as.character(patient_id),
+        driver_CN_likelihood = as.integer(driver_CN_likelihood),
+        driver_CN_category   = as.character(driver_CN_category),
+        driver_CN            = as.logical(driver_CN)
+      )
+    
+    ## Order columns: PURPLE schema + new fields
+    base_cols <- c(
+      "chromosome","chromosomeBand","gene","transcript","isCanonical",
+      "driver","category","likelihoodMethod","driverLikelihood",
+      "missense","nonsense","splice","inframe","frameshift",
+      "biallelic","minCopyNumber","maxCopyNumber","patient_id"
+    )
+    
+    out %>%
+      select(
+        any_of(base_cols),
+        driver_CN_likelihood,
+        driver_CN_category,
+        driver_CN
+      )
+  })
+  
+  ## Drop NULLs (samples with missing files)
+  per_sample <- per_sample[!vapply(per_sample, is.null, logical(1))]
+  
+  if (length(per_sample) == 0L) {
+    stop("No valid sample tables generated. Check paths / sample_ids.")
+  }
+  
+  bind_rows(per_sample)
+}
+
+## small helper so %||% works (if not already defined)
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+
+
+```
+
+
+```{r}
+drivers_mut <- subset(drivers_pca, drivers_pca$driver == "MUTATION")
+drivers_cnv <- subset(drivers_pca, drivers_pca$driver != "MUTATION")
+
+base_dir    <- "~/HMF/somatic/DR-252-update1"
+
+### driver genes list from Pablo
+driver_genes <- c(
+  "AR", "FOXA1", "SPOP", "ERG", "CCND1", "CDK4", "CDK6", "CDKN2B", "MDM2",
+  "RB1", "TP53", "KDM5A", "KDM6A", "KMT2C", "KMT2D", "PARP1", "MUTYH",
+  "ERCC2", "ERCC5", "ATM", "ATR", "PRKDC", "CDK12", "BAP1", "BARD1", "BLM",
+  "BRCA1", "BRCA2", "BRIP1", "CHEK1", "CHEK2", "FANCA", "PALB2", "RAD50",
+  "RAD51", "RAD51B", "RAD51C", "RAD51D", "MLH1", "MSH2", "MSH6", "BRAF",
+  "EP300", "B2M", "MYC", "ARID1A", "MET", "PIK3CA", "PIK3CB", "PTEN",
+  "AKT1", "CTNNB1", "APC"
+)
+
+pc_drivers <- build_pc_driver_dataframe(pats, base_dir, driver_genes = driver_genes)
+
+## we can subset copy number < 1.5 and > 5
+pc_drivers <- subset(pc_drivers, pc_drivers$minCopyNumber < 1.5 | pc_drivers$minCopyNumber > 5)
+
+## tidy up df
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+library(dplyr)
+library(ggplot2)
+
+library(dplyr)
+library(ggplot2)
+
+library(dplyr)
+library(ggplot2)
+
+df_plot <- pc_drivers_CNV %>%
+  filter(!is.na(minCopyNumber)) %>%
+  mutate(
+    gene = reorder(gene, minCopyNumber, FUN = median, na.rm = TRUE)
+  )
+
+ggplot(df_plot, aes(x = gene, y = minCopyNumber)) +
+  geom_violin(fill = "grey90", color = "grey70", scale = "width") +
+  geom_jitter(width = 0.25, alpha = 0.5, size = 1, color = "steelblue") +
+  scale_y_continuous(
+    trans = "log1p",
+    breaks = c(0, 1, 2, 4, 8, 16, 32, 64)
+  ) +
+  coord_flip() +
+  labs(
+    x = "Gene",
+    y = "Minimum copy number (log scale)",
+    title = "Full range of minimum copy number per gene"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+
+```{r}
+
+## now I need to create a joint drivers df with drivers_mut (all mutations in genes implicated in  prostate cancer) and pc_drivers_CNV
+drivers_mut <- subset(drivers_mut, drivers_mut$driverLikelihood >= 0.5)
+gene_pat_mut <- drivers_mut[, c("gene", "patient_id")]
+gene_pat_cnv <- pc_drivers_CNV[, c("gene", "patient_id")]
+
+gene_pat_drv_pc <- rbind(gene_pat_mut, gene_pat_cnv)
+```
+
+
+```{r}
+
+make_driver_matrix <- function(drivers, sample_ids, min_mut = 5) {
+  stopifnot(all(c("patient_id","gene") %in% names(drivers)))
+
+  dm <- drivers %>%
+    dplyr::distinct(patient_id, gene) %>%
+    dplyr::mutate(flag = 1L) %>%
+    tidyr::pivot_wider(names_from = gene, values_from = flag, values_fill = 0L)
+
+  # keep original gene symbols (no name mangling)
+  dm <- as.data.frame(dm, check.names = FALSE)
+  rownames(dm) <- dm$patient_id
+  dm$patient_id <- NULL
+
+  # Align to samples WITHOUT rbind; this will create NA rows for missing samples
+  dm <- dm[sample_ids, , drop = FALSE]
+  rownames(dm) <- sample_ids
+  dm[is.na(dm)] <- 0L
+
+  # numeric matrix
+  dm <- as.matrix(dm)
+  storage.mode(dm) <- "numeric"
+
+  # filter by mutation count
+  keep <- if (ncol(dm)) colSums(dm, na.rm = TRUE) >= min_mut else logical(0)
+  dm[, keep, drop = FALSE]
+}
+
+```
+
+
+```{r}
+analyze_driver_ssgsea <- function(
+  scores,
+  metadata,
+  drivers,
+  id_col = "patient_id",
+  covars = c("tumorPurity"),
+  min_mut = 5,
+  use_spline_for_tumorPurity = TRUE,
+  spline_df = 3,
+  drop_zero_var_covars = TRUE
+){
+  stopifnot(is.matrix(scores) || is.data.frame(scores))
+  scores <- as.matrix(scores)
+  samp <- colnames(scores)
+  if (is.null(samp)) stop("scores must have column names = sample IDs")
+
+  ## 1) align metadata
+  md <- metadata[match(samp, metadata[[id_col]]), , drop = FALSE]
+  if (anyNA(md[[id_col]])) {
+    missing <- samp[is.na(md[[id_col]])]
+    stop("These score columns are missing from metadata: ", paste(missing, collapse = ", "))
+  }
+  rownames(md) <- md[[id_col]]
+
+  ## 2) driver matrix
+  D <- make_driver_matrix(drivers, sample_ids = samp, min_mut = min_mut)
+  if (is.null(D) || ncol(D) == 0) stop("No drivers meet min_mut threshold.")
+  D <- D[match(samp, rownames(D)), , drop = FALSE]
+  rownames(D) <- samp
+
+  ## 3) covariates
+  if ("tumorPurity" %in% covars && !("tumorPurity" %in% names(md))) {
+    stop("You requested 'tumorPurity' but it is not present in metadata.")
+  }
+  cov_use <- intersect(covars, names(md))
+  cov_df  <- md[, cov_use, drop = FALSE]
+
+  # types
+  for (nm in names(cov_df)) {
+    if (!is.factor(cov_df[[nm]])) cov_df[[nm]] <- suppressWarnings(as.numeric(cov_df[[nm]]))
+  }
+  if ("treatmentGiven" %in% names(cov_df)) {
+    cov_df$treatmentGiven <- as.factor(metadata[match(rownames(cov_df), metadata[[id_col]]), "treatmentGiven"])
+  }
+
+  # spline for tumorPurity
+  if ("tumorPurity" %in% names(cov_df) && use_spline_for_tumorPurity) {
+    if (all(is.finite(cov_df$tumorPurity))) {
+      basis <- splines::ns(cov_df$tumorPurity, df = spline_df)
+      colnames(basis) <- paste0("tumorPurity_ns", seq_len(ncol(basis)))
+      cov_df <- cbind(cov_df[, setdiff(names(cov_df), "tumorPurity"), drop = FALSE],
+                      as.data.frame(basis))
+    } else {
+      warning("Non-finite values in tumorPurity; using raw tumorPurity (no spline).")
+    }
+  }
+
+  # NA-drop once, globally
+  if (ncol(cov_df)) {
+    keep <- stats::complete.cases(cov_df)
+    if (!all(keep)) {
+      message("Dropping ", sum(!keep), " samples with NA in covariates before fitting.")
+      cov_df <- cov_df[keep, , drop = FALSE]
+      md     <- md[keep, , drop = FALSE]
+      scores <- scores[, keep, drop = FALSE]
+      samp   <- colnames(scores)
+      D      <- D[keep, , drop = FALSE]
+    }
+  }
+
+  ## 4) encoder (helper)
+  encode_covariates <- function(df, drop_zero_var_covars = TRUE) {
+    if (is.null(df) || !ncol(df)) return(df)
+    parts <- list()
+    for (nm in names(df)) {
+      x <- df[[nm]]
+      if (is.factor(x)) {
+        mm <- stats::model.matrix(~ x, contrasts.arg = NULL)[, -1, drop = FALSE]
+        if (ncol(mm)) {
+          colnames(mm) <- paste(nm, make.names(colnames(mm)), sep = "_")
+          parts[[nm]] <- mm
+        }
+      } else {
+        parts[[nm]] <- matrix(as.numeric(x), ncol = 1,
+                              dimnames = list(rownames(df), nm))
+      }
+    }
+    if (!length(parts)) return(df[, 0, drop = FALSE])
+    out <- as.data.frame(do.call(cbind, parts), check.names = FALSE)
+    if (drop_zero_var_covars && ncol(out)) {
+      keep <- vapply(out, function(v) stats::var(v, na.rm = TRUE) > 0, logical(1))
+      if (!any(keep)) return(out[, 0, drop = FALSE])
+      out <- out[, keep, drop = FALSE]
+    }
+    if (ncol(out)) out <- out[, sort(colnames(out)), drop = FALSE]
+    out
+  }
+
+  ## 5) encode once and fit per driver
+  cov_encoded <- encode_covariates(cov_df, drop_zero_var_covars = drop_zero_var_covars)
+
+  run_one <- function(g) {
+    Mut <- as.integer(D[, g] > 0)
+    if (length(unique(Mut)) < 2) return(NULL)
+    design <- cbind(Intercept = 1, Mut = Mut)
+    if (!is.null(cov_encoded) && ncol(cov_encoded) > 0)
+      design <- cbind(design, cov_encoded)
+    rownames(design) <- colnames(scores)
+
+    fit <- limma::lmFit(scores, design)
+    fit <- limma::eBayes(fit)
+    tt  <- limma::topTable(fit, coef = "Mut", number = Inf)
+    tt$pathway <- rownames(tt)
+    tt$driver  <- g
+    keep <- c("driver","pathway","logFC","AveExpr","t","P.Value","adj.P.Val","B")
+    miss <- setdiff(keep, colnames(tt))
+    if (length(miss)) tt[miss] <- NA_real_
+    tt <- tt[, keep, drop = FALSE]
+    tt
+  }
+
+  res_list <- lapply(colnames(D), run_one)
+  res_list <- Filter(Negate(is.null), res_list)
+  if (!length(res_list)) stop("No drivers had both WT and Mut after alignment/filtering.")
+
+  all_res <- dplyr::bind_rows(res_list)
+  all_res$FDR_global <- p.adjust(all_res$P.Value, method = "BH")
+
+  return(list(per_driver = split(all_res, all_res$driver), all = all_res))
+}
+
+
+
+```
+
+
+
+
+```{r}
+suppressPackageStartupMessages({ library(ggplot2) })
+
+# res_all must have: driver, pathway, logFC, adj.P.Val
+plot_driver_volcano_with_pathway_legend <- function(
+  res_all, drv,
+  k = 10,
+  highlight_by = c("fdr","effect"),
+  title = NULL,
+  other_alpha = 0.35, other_size = 1.6, sel_size = 2.6,
+  legend_title_size = 9, legend_text_size = 7, legend_ncol = 1,
+  abbreviate_names = TRUE,  # shorten long pathway names in legend
+  abbrev_max = 35           # max characters for legend labels
+) {
+  highlight_by <- match.arg(highlight_by)
+  stopifnot(is.data.frame(res_all))
+  need <- c("driver","pathway","logFC","adj.P.Val")
+  if (!all(need %in% names(res_all))) stop("res_all must contain: ", paste(need, collapse=", "))
+
+  df <- res_all[res_all$driver == drv, , drop = FALSE]
+  if (nrow(df) == 0) stop(sprintf("No rows for driver '%s'", drv))
+  df <- as.data.frame(df)
+  df$logFC     <- as.numeric(df$logFC)
+  df$adj.P.Val <- as.numeric(df$adj.P.Val)
+
+  # choose which pathways to highlight in the legend
+  k <- max(1, min(k, nrow(df)))
+  sel_idx <- if (highlight_by == "fdr") {
+    order(df$adj.P.Val, decreasing = FALSE, na.last = NA)[seq_len(k)]
+  } else {
+    order(abs(df$logFC), decreasing = TRUE, na.last = NA)[seq_len(k)]
+  }
+  sel_paths <- unique(df$pathway[sel_idx])
+
+  # Optional: abbreviate legend labels
+  prettify <- function(x) {
+    x <- gsub("^HALLMARK_|^REACTOME_|^KEGG_", "", x)
+    x <- gsub("_", " ", x)
+    x <- trimws(x)
+    x
+  }
+  abbrev <- function(x, n) ifelse(nchar(x) > n, paste0(substr(x, 1, n-1), "…"), x)
+
+  df$legend_lab <- ifelse(df$pathway %in% sel_paths, df$pathway, "Other")
+  if (abbreviate_names) {
+    # only abbreviate the selected names; keep "Other" as is
+    is_sel <- df$legend_lab != "Other"
+    df$legend_lab[is_sel] <- prettify(df$legend_lab[is_sel])
+    df$legend_lab[is_sel] <- abbrev(df$legend_lab[is_sel], abbrev_max)
+  }
+  # make legend order: selected pathways first (in the same order), then "Other"
+  legend_levels <- c(unique(df$legend_lab[df$legend_lab != "Other" & df$pathway %in% sel_paths]), "Other")
+  df$legend_lab <- factor(df$legend_lab, levels = legend_levels)
+
+  # palette: distinct colors for selected pathways, grey for others
+  base_cols <- c("#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
+                 "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf")
+  n_sel <- length(legend_levels) - 1L
+  cols <- setNames(rep_len(base_cols, max(n_sel, 1L)), legend_levels[legend_levels != "Other"])
+  cols <- c(cols, Other = "grey70")
+
+  # split data: grey first, colored on top
+  df_other <- df[df$legend_lab == "Other", , drop = FALSE]
+  df_sel   <- df[df$legend_lab != "Other", , drop = FALSE]
+
+  p <- ggplot(NULL, aes(x = logFC, y = -log10(adj.P.Val), color = legend_lab)) +
+    # background grey points
+    geom_point(data = df_other, alpha = other_alpha, size = other_size, show.legend = TRUE) +
+    # highlighted points on top
+    geom_point(data = df_sel,   alpha = 1,           size = sel_size,  show.legend = TRUE) +
+    geom_vline(xintercept = 0, linetype = 3) +
+    scale_color_manual(
+      values = cols,
+      name   = ifelse(highlight_by=="fdr","Top pathways (FDR)","Top pathways (|Δ|)"),
+      guide  = guide_legend(
+        override.aes = list(size = 3, alpha = 1),
+        ncol = legend_ncol
+      )
+    ) +
+    labs(
+      title = if (is.null(title)) sprintf("ssGSEA pathways: %s Mut vs WT", drv) else title,
+      x = "Δ ssGSEA (logFC: Mut − WT)",
+      y = "-log10 FDR"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.title = element_text(size = legend_title_size),
+      legend.text  = element_text(size = legend_text_size)
+    )
+
+  p
+}
+```
+
+```{r}
+library(ComplexHeatmap)
+library(grid)
+library(circlize)
+
+plot_driver_top_heatmap <- function(scores, metadata, driver, drivers_matrix,
+                                    id_col = "patient_id", top_n = 30, CR=F) {
+
+  md <- metadata[match(colnames(scores), metadata[[id_col]]), , drop=FALSE]
+  mut_flag <- factor(drivers_matrix[colnames(scores), driver], levels=c(0,1), labels=c("WT","Mut"))
+
+  # pick top pathways by absolute mean difference
+  diffs <- rowMeans(scores[, mut_flag=="Mut", drop=FALSE]) - rowMeans(scores[, mut_flag=="WT", drop=FALSE])
+  top_pw <- names(sort(abs(diffs), decreasing = TRUE))[seq_len(min(top_n, length(diffs)))]
+  mat   <- scores[top_pw, , drop=FALSE]
+
+  # (optional) purity/batch-adjusted for DISPLAY only
+  if (all(c("batch","purity") %in% names(md))) {
+    mat <- t(residuals(lm(t(mat) ~ md$batch + md$purity)))
+  }
+
+  # z for display
+  mat_z <- t(scale(t(mat))); mat_z[!is.finite(mat_z)] <- 0
+
+  ha <- HeatmapAnnotation(
+    Driver = mut_flag,
+    col = list(Driver = c(WT="#BBBBBB", Mut="#222222")),
+    # make annotation legend horizontal
+    annotation_legend_param = list(
+      Driver = list(direction = "horizontal", nrow = 1)
+    )
+  )
+
+  Heatmap(
+    mat_z,
+    name = "ssGSEA z",
+    top_annotation = ha,
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    cluster_rows = CR,
+    cluster_columns = TRUE,
+    column_title = paste(driver, "Mut vs WT (top pathways)"),
+    col = colorRamp2(c(-4,0,4), c("#313695","#FFFFFF","#a50026")),
+    # smaller pathway labels on the RIGHT
+    row_names_side = "right",
+    row_names_gp = gpar(fontsize = 6),                     # <-- tweak size here
+    row_names_max_width = unit(8, "cm"),                   # <-- widen if you need more space
+    # heatmap legend horizontal
+    heatmap_legend_param = list(direction = "horizontal", title_position = "topcenter")
+  )
+}
+```
+
+With this we can compare the differential expression of genes from different pathways for patients with alterations in any gene compared to patients WT for that gene.
+
+```{r}
+# scores: pathways x samples
+# drivers: data.frame(patient_id, gene, ...)
+# metadata: data.frame(patient_id, batch, purity, ...)
+
+### subset drivers with driver likelihood > 0.5
+drivers <- subset(drivers, drivers$driverLikelihood > 0.5)
+
+res <- analyze_driver_ssgsea(scores, metadata, pc_drivers,
+                             covars = c("tumorPurity"),
+                             use_spline_for_tumorPurity = TRUE, spline_df = 3)
+
+
+## more prostate cancer specific
+res_pc_spec <- analyze_driver_ssgsea(scores, metadata, drivers_pc,
+                             covars = c("tumorPurity"),
+                             use_spline_for_tumorPurity = TRUE, spline_df = 3)
+
+
+res_p_t <- analyze_driver_ssgsea(scores, metadata, drivers,
+                             id_col = "patient_id",
+                             covars = c("tumorPurity", "treatmentGiven"),
+                             min_mut = 5) 
+
+res_all <- res$all
+res_all_pc_spec <- res_pc_spec$all
+
+
+## if I include RB1 with copy number < 1.5 & > 5 the association between RB1 alterations and gene expr dissapears
+
+## so let's try to "load the deck" - include all previous pc_drivers but subset the drivers for RB1
+
+pc_drivers_noRB1 <- subset(pc_drivers, pc_drivers$gene != "RB1")
+pc_drivers_RB1_spec <- rbind(pc_drivers, RB1_drivers)
+
+```
+
+
+```{r}
+# Per-driver volcano
+print(plot_driver_volcano_with_pathway_legend(res$all, drv = "BRCA2")) 
+```
+```{r}
+print(plot_driver_volcano_with_pathway_legend(res$all, drv = "RB1")) 
+```
+
+Now I want to compare the effects of treatment types on gene expression in different pathways.
+
+```{r}
+# Heatmap for one driver
+Dmat <- make_driver_matrix(drivers, sample_ids = colnames(scores), min_mut = 5)  # to build flags for plotting
+ht <- plot_driver_top_heatmap(scores, metadata, driver = "RB1", drivers_matrix = Dmat,
+                              id_col = "patient_id", top_n = 10, CR=T)
+
+# Legends side-by-side at the bottom
+draw(ht, merge_legends = FALSE,
+  heatmap_legend_side = "bottom",
+  annotation_legend_side = "bottom"
+)
+```
+
+Most results are small changes in terms of logFC so let's focus on adjusted p value and plot all results (gene - pathway) with adj pvalue \< 0.01 to build a picture of the most significant driver alterations in terms of affected pathways.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(stringr)
+
+plot_resall_bubbles <- function(res_all, alpha = 0.01) {
+  need <- c("driver","pathway","logFC","adj.P.Val")
+  stopifnot(all(need %in% names(res_all)))
+  
+  sig <- res_all %>%
+    mutate(adj.P.Val = as.numeric(adj.P.Val),
+           logFC     = as.numeric(logFC)) %>%
+    filter(!is.na(adj.P.Val), adj.P.Val <= alpha) %>%
+    mutate(minuslog10 = -log10(adj.P.Val))
+  
+  if (nrow(sig) == 0) stop("No rows ≤ alpha.")
+  
+  # Order drivers by median significance; order pathways by overall significance
+  drv_order <- sig %>% group_by(driver) %>% summarise(med = median(minuslog10)) %>%
+    arrange(desc(med)) %>% pull(driver)
+  pwy_order <- sig %>% arrange(desc(minuslog10)) %>% pull(pathway) %>% unique()
+  
+  sig <- sig %>%
+    mutate(driver  = factor(driver,  levels = drv_order),
+           pathway = factor(pathway, levels = pwy_order))
+  
+  p <- ggplot(sig, aes(x = driver, y = pathway)) +
+    geom_point(aes(size = minuslog10, fill = logFC), shape = 21, alpha = 0.9, stroke = 0.2) +
+    scale_size_continuous(name = "-log10(adj.P)", range = c(2, 8)) +
+    scale_fill_gradient2(
+  name = "Effect (logFC)",
+  low = "blue", mid = "white", high = "red",
+  midpoint = 0
+) +
+    labs(x = "Driver", y = "Pathway",
+         title = sprintf("Significant results (adj.P ≤ %.3g)", alpha)) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid.major.x = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "right")
+  
+  print(p)
+  
+  # Optional: save with height scaled to the number of unique pathways
+  h <- max(6, 0.25 * length(levels(sig$pathway)))
+  w <- max(6, 0.18 * length(levels(sig$driver)))
+  ggsave("resall_bubbles.pdf", p, width = w, height = h, units = "in")
+}
+
+# Usage:
+```
+
+```{r}
+plot_resall_bubbles(res$all, alpha = 0.01)
+```
+
+![](images/clipboard-761381520.png)
+```{r}
+plot_resall_bubbles(res_all_pc_spec, alpha = 0.01)
+```
+
+```{r}
+## plot results for ssGSEA vs drivers correceted for purity and treatment
+plot_resall_bubbles(res_p_t$all, alpha = 0.01)
+```
+
+Now let's see how BRCA2 compares to the results with p<0.01
+
+```{r}
+plot_resall_bubbles <- function(res_all,
+                                alpha = 0.01,
+                                include_drivers = c("BRCA2", "TP53")) {
+  need <- c("driver","pathway","logFC","adj.P.Val")
+  stopifnot(all(need %in% names(res_all)))
+
+  df <- res_all %>%
+    dplyr::mutate(
+      adj.P.Val = suppressWarnings(as.numeric(adj.P.Val)),
+      logFC     = suppressWarnings(as.numeric(logFC)),
+      sig_flag  = !is.na(adj.P.Val) & adj.P.Val <= alpha,
+      incl_flag = driver %in% include_drivers
+    )
+
+  keep <- df %>%
+    dplyr::filter(sig_flag | incl_flag) %>%
+    dplyr::filter(!is.na(adj.P.Val)) %>%             # need sizes
+    dplyr::mutate(
+      minuslog10 = -log10(adj.P.Val),
+      status = dplyr::case_when(
+        sig_flag ~ sprintf("Significant (adj.P ≤ %.3g)", alpha),
+        incl_flag ~ sprintf("Included driver (not ≤ %.3g)", alpha)
+      )
+    )
+
+  if (nrow(keep) == 0) stop("No rows to plot after filtering.")
+
+  # Ordering
+  drv_order <- keep %>%
+    dplyr::group_by(driver) %>%
+    dplyr::summarise(med = stats::median(minuslog10), .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(med)) %>%
+    dplyr::pull(driver)
+
+  pwy_order <- keep %>%
+    dplyr::arrange(dplyr::desc(minuslog10)) %>%
+    dplyr::pull(pathway) %>% unique()
+
+  keep <- keep %>%
+    dplyr::mutate(
+      driver  = factor(driver,  levels = drv_order),
+      pathway = factor(pathway, levels = pwy_order),
+      status  = factor(
+        status,
+        levels = c(
+          sprintf("Significant (adj.P ≤ %.3g)", alpha),
+          sprintf("Included driver (not ≤ %.3g)", alpha)
+        )
+      )
+    )
+
+  p <- ggplot2::ggplot(keep, ggplot2::aes(x = driver, y = pathway)) +
+    ggplot2::geom_point(
+      ggplot2::aes(size = minuslog10, fill = logFC, alpha = status),
+      shape = 21, stroke = 0.2
+    ) +
+    ggplot2::scale_size_continuous(name = "-log10(adj.P)", range = c(2, 8)) +
+    ggplot2::scale_fill_gradient2(
+      name = "Effect (logFC)",
+      low = "blue", mid = "white", high = "red", midpoint = 0
+    ) +
+    ggplot2::scale_alpha_manual(
+      name = "Status",
+      values = c(0.9, 0.35)   # matches the 'status' factor levels above
+    ) +
+    ggplot2::labs(
+      x = "Driver", y = "Pathway",
+      title = sprintf(
+        "Significant (adj.P ≤ %.3g) plus included drivers: %s",
+        alpha, paste(include_drivers, collapse = ", ")
+      )
+    ) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(
+      panel.grid.major.x = ggplot2::element_blank(),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+      legend.position = "right"
+    )
+
+  print(p)
+
+  h <- max(6, 0.25 * nlevels(keep$pathway))
+  w <- max(6, 0.18 * nlevels(keep$driver))
+  ggplot2::ggsave("resall_bubbles_plus_included.pdf", p, width = w, height = h, units = "in")
+}
+
+
+
+```
+```{r}
+plot_resall_bubbles(res_all,
+                    alpha = 0.015,
+                    include_drivers = c("BRCA2", "TP53"))
+```
+
+Now I want to find the smallest adjusted-p threshold such that, using the genes shown in the bubble plot (i.e., all drivers with adj.P.Val), every patient in your cohort has at least one alteration in at least one of those genes.
+```{r}
+# Find the minimal alpha so that selected genes cover (hit) all patients at least once
+# Inputs:
+#   res_all:       data.frame with columns c("driver","adj.P.Val") (others ignored)
+#   drivers_long:  data.frame with columns c("patient_id","gene") listing altered genes per patient
+#   cohort_ids:    character vector of patient IDs that define your cohort universe
+#   include_drivers: drivers to always include regardless of alpha (e.g., c("BRCA2","TP53"))
+#
+# Returns: a list with
+#   $alpha_min      minimal alpha achieving full coverage, or NA if impossible
+#   $coverage_df    data.frame(alpha, n_genes, covered, total, prop, uncovered_ids)
+#   $selected_genes genes at alpha_min (or at max alpha if impossible)
+find_min_alpha_for_full_coverage <- function(res_all,
+                                             drivers_long,
+                                             cohort_ids,
+                                             include_drivers = c("BRCA2","TP53")) {
+  # ---- checks ----
+  need_res <- c("driver","adj.P.Val")
+  stopifnot(all(need_res %in% names(res_all)))
+  need_drv <- c("patient_id","gene")
+  stopifnot(all(need_drv %in% names(drivers_long)))
+  stopifnot(is.character(cohort_ids) && length(cohort_ids) > 0)
+
+  # ---- clean ----
+  res_all <- res_all %>%
+    dplyr::transmute(driver = as.character(driver),
+                     adj.P.Val = suppressWarnings(as.numeric(adj.P.Val))) %>%
+    dplyr::filter(!is.na(driver) & !is.na(adj.P.Val))
+
+  drivers_long <- drivers_long %>%
+    dplyr::transmute(patient_id = as.character(patient_id),
+                     gene = as.character(gene)) %>%
+    dplyr::filter(!is.na(patient_id) & !is.na(gene))
+
+  # Work only with patients in the cohort
+  drivers_long <- dplyr::filter(drivers_long, patient_id %in% cohort_ids)
+  cohort_ids <- unique(cohort_ids)
+  total <- length(cohort_ids)
+
+  # If some patients have no alterations at all in drivers_long, full coverage may be impossible
+  pts_with_any_alt <- unique(drivers_long$patient_id)
+
+  # Candidate alphas: unique sorted p-values in res_all; also include 0 to allow "only include_drivers"
+  candidates <- sort(unique(res_all$adj.P.Val))
+  candidates <- unique(c(0, candidates))
+
+  coverage_rows <- vector("list", length(candidates))
+
+  # Precompute: for each alpha, which drivers are selected
+  for (i in seq_along(candidates)) {
+    a <- candidates[i]
+    sel_genes <- unique(c(include_drivers,
+                          res_all$driver[res_all$adj.P.Val <= a]))
+
+    covered_ids <- unique(drivers_long$patient_id[drivers_long$gene %in% sel_genes])
+    uncovered_ids <- setdiff(cohort_ids, covered_ids)
+
+    coverage_rows[[i]] <- data.frame(
+      alpha = a,
+      n_genes = length(unique(sel_genes)),
+      covered = length(covered_ids),
+      total = total,
+      prop = if (total > 0) length(covered_ids) / total else NA_real_,
+      uncovered_ids = I(list(uncovered_ids)),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  coverage_df <- dplyr::bind_rows(coverage_rows)
+
+  # Minimal alpha achieving full coverage (prop == 1)
+  if (any(coverage_df$prop == 1)) {
+    alpha_min <- min(coverage_df$alpha[coverage_df$prop == 1])
+    selected_genes <- unique(c(include_drivers,
+                               res_all$driver[res_all$adj.P.Val <= alpha_min]))
+  } else {
+    alpha_min <- NA_real_
+    # If impossible, return gene set at the largest tested alpha
+    a_max <- max(coverage_df$alpha)
+    selected_genes <- unique(c(include_drivers,
+                               res_all$driver[res_all$adj.P.Val <= a_max]))
+  }
+
+  list(alpha_min = alpha_min,
+       coverage_df = coverage_df,
+       selected_genes = sort(unique(selected_genes)))
+}
+
+# Optional: quick plot of coverage vs alpha
+plot_coverage_vs_alpha <- function(coverage_df) {
+  ggplot2::ggplot(coverage_df, ggplot2::aes(x = alpha, y = prop)) +
+    ggplot2::geom_step() +
+    ggplot2::geom_point() +
+    ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) +
+    ggplot2::labs(x = "Adjusted p-value threshold (alpha)",
+                  y = "Patient coverage (≥1 alteration in selected genes)",
+                  title = "Coverage vs adjusted p-value threshold") +
+    ggplot2::theme_minimal(base_size = 11)
+}
+
+```
+
+```{r}
+res <- find_min_alpha_for_full_coverage(
+  res_all       = res_all,
+  drivers_long  = drivers,             # cols: patient_id, gene
+  cohort_ids    = colnames(scores),
+  include_drivers = character(0)       # <- exclude BRCA2/TP53 (and any others)
+)
+
+res$alpha_min
+res$selected_genes
+coverage_df <- res$coverage_df
+plot_coverage_vs_alpha(res$coverage_df)
+
+```
+```{r}
+```
+Sanity checks
+
+Irene's work shows that in plasma EV-RNA, normalised expression  of RB1 does not change between alt and WT. So now I want to check this in the HMF data  
+
+```{r}
+# Packages you likely already have
+library(dplyr)
+library(ggplot2)
+library(broom)
+library(splines)
+library(emmeans)
+
+# Format p with 2 decimals; use ×10^k for small values
+.format_p_x10 <- function(p) {
+  if (is.na(p)) return("p = NA")
+  if (p >= 0.01) {
+    sprintf("p = %.2f", p)
+  } else if (p > 0) {
+    e <- floor(log10(p))
+    m <- p / (10^e)              # mantissa in [1, 10)
+    sprintf("p = %.2f \u00D710^%d", m, e)   # \u00D7 = ×
+  } else {
+    "p < 1.00 \u00D710^-308"     # fallback for underflow
+  }
+}
+
+
+# expr:   matrix or data.frame, rows = genes, cols = samples (log1p-CPM is fine)
+# metadata: data.frame with columns patient_id and tumorPurity (numeric in [0,1])
+# drivers: long data.frame with columns patient_id, gene (one row per altered gene/patient)
+# gene:   gene symbol to test (character)
+# id_col: sample/patient id column name in metadata (default "patient_id")
+# df_purity: spline df for tumorPurity (set 1 to treat purity as linear)
+library(splines)
+library(emmeans)
+library(broom)
+library(ggplot2)
+
+compare_gene_expr_by_mutation <- function(
+  gene, expr, metadata, drivers,
+  id_col       = "patient_id",
+  purity_col   = "tumorPurity",
+  df_purity    = 3,                 # >1 uses spline; 1 uses linear
+  return_plot  = TRUE
+){
+  # --- deps ---
+  stopifnot(requireNamespace("splines", quietly = TRUE))
+  stopifnot(requireNamespace("emmeans", quietly  = TRUE))
+  stopifnot(requireNamespace("broom", quietly    = TRUE))
+  stopifnot(requireNamespace("ggplot2", quietly  = TRUE))
+
+  # --- inputs & alignment ---
+  expr <- as.matrix(expr)
+  if (is.null(colnames(expr))) stop("'expr' must have column names = sample IDs/patient IDs.")
+  if (!gene %in% rownames(expr)) stop(sprintf("Gene '%s' not found in rownames(expr).", gene))
+  if (!all(c(id_col, purity_col) %in% names(metadata)))
+    stop("metadata must contain: ", paste(c(id_col, purity_col), collapse = ", "))
+  if (!all(c(id_col, "gene") %in% names(drivers)))
+    stop("drivers must contain: ", paste(c(id_col, "gene"), collapse = ", "))
+
+  # Mutation status for THIS gene
+  mut_ids <- unique(drivers[[id_col]][drivers[["gene"]] == gene])
+  Mut <- factor(ifelse(colnames(expr) %in% mut_ids, "Mut", "WT"), levels = c("WT","Mut"))
+
+  # Align metadata to expr columns
+  md <- metadata[match(colnames(expr), metadata[[id_col]]), , drop = FALSE]
+  if (anyNA(md[[id_col]])) {
+    miss <- colnames(expr)[is.na(md[[id_col]])]
+    stop("These expr columns have no metadata match in '", id_col, "': ", paste(miss, collapse = ", "))
+  }
+
+  pur <- md[[purity_col]]
+  if (!is.numeric(pur)) stop(purity_col, " must be numeric in [0,1].")
+  pur <- pmin(pmax(pur, 0), 1)  # clamp to [0,1]
+
+  # Build modeling frame
+  df <- data.frame(
+    sample_id = md[[id_col]],
+    expr      = as.numeric(expr[gene, colnames(expr)]),
+    Mut       = Mut,
+    purity    = pur,
+    stringsAsFactors = FALSE
+  )
+  df <- stats::na.omit(df)
+  if (nlevels(droplevels(df$Mut)) < 2)
+    stop("Need both WT and Mut groups; counts: ", paste(with(rle(sort(as.character(df$Mut))), paste(values, lengths, sep=":")), collapse=", "))
+
+  # ---- Precompute spline basis (NO ns() in the model call) ----
+  if (df_purity > 1) {
+    B <- splines::ns(df$purity, df = df_purity)
+    colnames(B) <- paste0("pur_s", seq_len(ncol(B)))
+    df <- cbind(df, as.data.frame(B))
+    form_mut   <- as.formula(paste("expr ~ Mut +", paste(colnames(B), collapse = " + ")))
+    form_purity<- as.formula(paste("expr ~",       paste(colnames(B), collapse = " + ")))
+  } else {
+    form_mut    <- expr ~ Mut + purity
+    form_purity <- expr ~ purity
+  }
+  
+  # Rename mutation status levels
+  levels(df$Mut) <- c("WT", "Alt")
+
+  # Fit models
+  fit             <- stats::lm(form_mut,    data = df)
+  fit_purity_only <- stats::lm(form_purity, data = df)
+
+  # emmeans: adjusted means & contrast (safe now; no ns() in the call)
+  emm       <- emmeans::emmeans(fit, ~ Mut, data = df)
+  contrast  <- emmeans::contrast(emm, method = "revpairwise")
+  contrast_df <- broom::tidy(contrast, conf.int = TRUE)
+  contrast_df$contrast <- gsub("Mut", "Alt", contrast_df$contrast)
+
+  # Pull Mut vs WT coefficient from lm as well (for reference)
+  coef_tbl <- broom::tidy(fit, conf.int = TRUE)
+  mut_row  <- subset(coef_tbl, grepl("^Mut", term))[, c("term","estimate","conf.low","conf.high","p.value")]
+
+  # Partial (purity-adjusted) expression for plotting
+  df$expr_partial <- df$expr - stats::predict(fit_purity_only, newdata = df)
+
+  p <- NULL
+  if (return_plot) {
+    # mean +/- 1.96*SE by group on partial scale
+    summ <- aggregate(expr_partial ~ Mut, data = df,
+                      FUN = function(x) c(mean = mean(x), se = stats::sd(x)/sqrt(length(x))))
+    summ <- data.frame(
+      Mut  = summ$Mut,
+      mean = vapply(summ$expr_partial, function(z) z["mean"], numeric(1)),
+      se   = vapply(summ$expr_partial, function(z) z["se"],   numeric(1))
+    )
+    # Box only:
+p <- ggplot(df, aes(Mut, expr_partial, fill = Mut)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.9, color = "white") +
+  geom_point(position = position_jitter(width = 0.12), size = 1.3, alpha = 0.65) +
+  scale_fill_manual(values = pal, guide = "none") +
+  labs(title = paste0(gene, " expression: Alt vs WT (purity-adjusted) - log1p-CPM)"),
+    x = NULL, y = "Partial expression") +
+  theme_minimal(base_size = 13)
+
+p <- p + theme(axis.text.x = element_text(size = 16, face = "bold"))
+
+## add p-value
+# Get adjusted Mut–WT p-value from emmeans contrast
+pval <- contrast_df$p.value[1]  # or use your local contrast_df
+est <- contrast_df$estimate[1]  
+
+# edit format
+pv_text <- .format_p_x10(contrast_df$p.value[1])
+eff_text <- sprintf("Δ (Alt − WT) = %.2f", est)
+
+# Position it above the violins
+yr <- range(df$expr_partial, na.rm = TRUE)
+y_top <- yr[2]
+y_pad <- 0.12 * diff(yr)
+
+p <- p +
+  annotate("text",
+           x = 1.5,                       # centered between WT (1) and Mut (2)
+           y = y_top + y_pad,
+           label = paste(pv_text, "|", eff_text),
+           fontface = "bold",
+           size = 5) +
+  expand_limits(y = y_top + 1.5*y_pad)
+
+
+  }
+
+  list(
+    gene     = gene,
+    n_WT     = sum(df$Mut == "WT"),
+    n_Mut    = sum(df$Mut == "Alt"),
+    model    = fit,
+    emmeans  = list(emm = emm, contrast = contrast, contrast_df = contrast_df),
+    mut_vs_wt_coef = mut_row,   # from lm on log1p-CPM scale
+    plot     = p,
+    data_used = df
+  )
+}
+
+
+```
+
+
+```{r}
+names(metadata)[1] <- "patient_id"
+
+metadata_exp <- metadata[metadata$patient_id %in% colnames(expr_for_ssgsea), ]
+drivers_exp <- drivers[drivers$patient_id %in% colnames(expr_for_ssgsea), ]
+
+```
+```{r}
+# Check core names early
+names_in_expr   <- colnames(expr_for_ssgsea)
+names_in_meta   <- metadata$patient_id
+names_in_driver <- drivers$patient_id
+
+cat("expr cols not in metadata:", sum(!names_in_expr %in% names_in_meta), "\n")
+cat("expr cols not in drivers :", sum(!names_in_expr %in% names_in_driver), "\n")
+cat("missing metadata cols    :", paste(setdiff(c("patient_id","tumorPurity"), names(metadata)), collapse=", "), "\n")
+cat("missing drivers cols     :", paste(setdiff(c("patient_id","gene"), names(drivers)), collapse=", "), "\n")
+
+norm_id <- function(x) gsub("[^A-Za-z0-9]", "", toupper(trimws(x)))
+
+expr_ids <- norm_id(colnames(expr_for_ssgsea))
+drv_ids  <- norm_id(drivers$patient_id)
+
+setdiff(expr_ids, drv_ids)  # should go to length 0 if it was punctuation/case
+
+expr_for_ssgsea <- expr_for_ssgsea[, !(colnames(expr_for_ssgsea) %in% "CPCT02020310T"), drop = FALSE]
+
+df_debug <- res$data_used  # or rebuild df as above just before fit
+setdiff(c("expr","Mut","purity"), names(df_debug))  # should be character(0)
+
+"RB1" %in% rownames(expr_for_ssgsea)
+"patient_id" %in% names(metadata_exp)
+
+
+library(dplyr)
+
+gene <- "RB1"
+expr <- as.matrix(expr_for_ssgsea)
+
+mut_ids <- unique(drivers_exp$patient_id[drivers_exp$gene == gene])
+Mut <- factor(ifelse(colnames(expr) %in% mut_ids, "Mut", "WT"), levels = c("WT","Mut"))
+
+md <- metadata_exp[match(colnames(expr), metadata_exp$patient_id), , drop = FALSE]
+stopifnot(!anyNA(md$patient_id))
+
+pur <- md$tumorPurity
+stopifnot(is.numeric(pur))
+pur <- pmin(pmax(pur, 0), 1)
+
+df <- data.frame(
+  sample_id = md$patient_id,
+  expr      = as.numeric(expr[gene, colnames(expr)]),
+  Mut       = Mut,
+  purity    = pur,
+  stringsAsFactors = FALSE
+) |> na.omit()
+
+# Verify we truly have the needed columns
+print(class(df))
+print(names(df))
+stopifnot(all(c("expr","Mut","purity") %in% names(df)))
+table(df$Mut)
+
+
+library(emmeans)
+
+pal <- c(WT = "#7A7A7A", Alt = "#1F77B4")
+
+res_exp_RB1 <- compare_gene_expr_by_mutation(
+  gene      = "RB1",
+  expr      = expr_for_ssgsea,
+  metadata  = metadata_exp,              # needs patient_id and tumorPurity
+  drivers   = drivers_exp,               # needs patient_id and gene
+  id_col    = "patient_id",
+  purity_col= "tumorPurity",
+  df_purity = 3                      # use 1 for linear purity
+)
+
+res_exp_BRCA2 <- compare_gene_expr_by_mutation(
+  gene      = "BRCA2",
+  expr      = expr_for_ssgsea,
+  metadata  = metadata_exp,              # needs patient_id and tumorPurity
+  drivers   = drivers_exp,               # needs patient_id and gene
+  id_col    = "patient_id",
+  purity_col= "tumorPurity",
+  df_purity = 3                      # use 1 for linear purity
+)
+
+
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(limma); library(splines); library(dplyr); library(tidyr); library(ggplot2)
+})
+
+# scores: pathways x samples (from gsva(..., method="ssgsea", normalize=TRUE))
+# metadata: includes sample id and covariates
+analyze_treatment_ssgsea <- function(scores, metadata,
+                                     sample_col = "patient_id",
+                                     treat_col  = "treatment",
+                                     covars     = c("batch","purity"),
+                                     make_all_pairwise = TRUE) {
+  md <- metadata[match(colnames(scores), metadata[[sample_col]]), , drop = FALSE] |> as.data.frame()
+  stopifnot(all(!is.na(md[[treat_col]])))
+  md[[treat_col]] <- factor(md[[treat_col]])
+
+  # Build covariate frame (allow nonlinear purity)
+  cov_df <- md[, intersect(covars, names(md)), drop = FALSE]
+  if ("purity" %in% names(cov_df)) cov_df$purity <- ns(cov_df$purity, df = 3)
+
+  # Design with treatment as cell means (0 + factor) + covariates
+  X_treat <- model.matrix(~ 0 + md[[treat_col]])
+  colnames(X_treat) <- levels(md[[treat_col]])
+  X_cov   <- if (ncol(cov_df)) model.matrix(~ 0 + ., data = cov_df) else NULL
+  design  <- if (is.null(X_cov)) X_treat else cbind(X_treat, X_cov)
+
+  fit <- lmFit(scores, design)
+
+  # Contrasts
+  if (make_all_pairwise && nlevels(md[[treat_col]]) >= 2) {
+    lev <- levels(md[[treat_col]])
+    # All pairwise: second minus first
+    contr_matrix <- makeContrasts(contrasts = as.vector(outer(lev, lev, paste, sep = " - ")),
+                                  levels = colnames(design))
+    # Drop self-contrasts and duplicates (A-A, B - A & A - B both present; keep one direction)
+    keep <- grep(" - ", colnames(contr_matrix))
+    contr_matrix <- contr_matrix[, keep, drop = FALSE]
+    contr_matrix <- contr_matrix[, colSums(contr_matrix != 0) == 2, drop = FALSE]
+  } else {
+    stop("Provide specific contrasts via limma::makeContrasts if not using all pairwise.")
+  }
+
+  fit2 <- eBayes(contrasts.fit(fit, contr_matrix))
+
+  # Tidy per-contrast tables
+  tabs <- lapply(colnames(contr_matrix), function(ct) {
+    tt <- topTable(fit2, coef = ct, number = Inf)
+    tt$pathway  <- rownames(tt)
+    tt$contrast <- ct
+    tt[, c("contrast","pathway","logFC","AveExpr","t","P.Value","adj.P.Val")]
+  })
+  res_all <- bind_rows(tabs)
+
+  list(fit = fit2, results = res_all, levels = levels(md[[treat_col]]))
+}
+
+# Example usage:
+# tr_res <- analyze_treatment_ssgsea(scores, metadata, sample_col="patient_id",
+#                                    treat_col="treatment", covars=c("batch","purity"))
+# head(tr_res$results)
+
+```
+
+Let's incorporate survival times calculated from the metadata:
+
+Biopsy –\> treatment
+
+Biopsy –\> death
+
+Treatment –\> death
+
+```{r}
+### Import meta survival
+meta_survival <- read.csv("~/HMF/metadata/meta_survival.csv")
+```
+
+```{r}
+## the metadata doesn't have data for all patients with RNA-seq
+meta_survival <- meta_survival[meta_survival$sampleId %in% metadata$patient_id, ]
+names(meta_survival)[1] <- "patient_id"
+metadata <- metadata[metadata$patient_id %in% meta_survival$patient_id, ]
+counts_meta <- counts[, colnames(counts) %in% meta_survival$patient_id]
+drivers <- drivers[drivers$patient_id %in% metadata$patient_id, ]
+scores <- scores[, colnames(scores) %in% metadata$patient_id]
+
+## merge metadata
+meta_all <- cbind(meta_survival, metadata, by = "patient_id")
+```
+
+```{r}
+
+```
+
+```{r}
+library(limma)
+library(splines)
+
+# inputs:
+# scores: pathways x samples (ssGSEA)
+# metadata: data.frame with patient_id, biopsy2treatment_months, purity, batch, etc.
+# D: samples x drivers 0/1 matrix with rownames = sample IDs matching colnames(scores)
+# g: the driver gene name to test, e.g., "TP53"
+# covars: character vector of covariate names in metadata, e.g., c("batch","purity")
+
+analyze_one_driver_interaction <- function(scores, metadata, D, g,
+                                           id_col   = "patient_id",
+                                           months_col = "biopsy2treatment",
+                                           covars   = c("batch","purity"),
+                                           use_patient_block = TRUE) {
+  samples <- colnames(scores)
+
+  # 1) Align metadata to scores columns
+  md <- metadata[match(samples, metadata[[id_col]]), , drop = FALSE]
+  if (anyNA(md[[id_col]])) {
+    missing_ids <- samples[is.na(md[[id_col]])]
+    stop("These score columns are missing from metadata: ", paste(missing_ids, collapse = ", "))
+  }
+  rownames(md) <- md[[id_col]]
+
+  # 2) Build tx_status and mut
+  md[[months_col]] <- as.numeric(md[[months_col]])
+  md$tx_status <- factor(ifelse(md[[months_col]] > 0, "PRE", "POST"),
+                         levels = c("PRE","POST"))
+  if (!g %in% colnames(D)) stop("Driver '", g, "' not found in D.")
+  if (!all(rownames(D) %in% samples)) {
+    # re-align D to samples
+    D <- D[samples, , drop = FALSE]
+  }
+  md$mut <- factor(D[samples, g], levels = c(0,1), labels = c("WT","Mut"))
+
+  # 3) Build covariates (with spline for purity if present)
+  cov_df <- md[, intersect(covars, names(md)), drop = FALSE]
+  if ("purity" %in% names(cov_df)) cov_df$purity <- ns(as.numeric(cov_df$purity), df = 3)
+
+  # 4) One complete-cases mask applied to BOTH md and scores
+  vars_needed <- c("mut","tx_status", colnames(cov_df))
+  keep <- complete.cases(md[, vars_needed, drop = FALSE])
+  if (!all(keep)) {
+    # drop the same samples from BOTH objects
+    md <- md[keep, , drop = FALSE]
+    cov_df <- cov_df[keep, , drop = FALSE]
+    scores <- scores[, keep, drop = FALSE]
+  }
+
+  # Check factor levels (need ≥2 levels to estimate)
+  if (nlevels(md$tx_status) < 2) stop("tx_status has <2 levels after filtering.")
+  if (nlevels(md$mut) < 2)      stop("mut has <2 levels for driver '", g, "' after filtering.")
+
+  # 5) Design & fit
+  design <- model.matrix(~ mut * tx_status + ., data = cbind(md[, c("mut","tx_status"), drop = FALSE], cov_df))
+  stopifnot(nrow(design) == ncol(scores))  # must match
+
+  if (use_patient_block && any(duplicated(md[[id_col]]))) {
+    block <- factor(md[[id_col]])
+    corfit <- duplicateCorrelation(scores, design, block = block)
+    fit <- lmFit(scores, design, block = block, correlation = corfit$consensus.correlation)
+  } else {
+    fit <- lmFit(scores, design)
+  }
+  fit <- eBayes(fit)
+
+  # Interaction term: (Mut−WT in POST) − (Mut−WT in PRE)
+  tt <- topTable(fit, coef = "mutMut:tx_statusPOST", number = Inf)
+  tt$pathway <- rownames(tt)
+  tt$driver  <- g
+  tt[, c("driver","pathway","logFC","t","P.Value","adj.P.Val")]
+}
+```
+
+```{r}
+# --- example call ---
+res_rb1 <- analyze_one_driver_interaction(scores, meta_all, Dmat, g = "RB1",
+                                           id_col = "patient_id",
+                                           months_col = "biopsy2treatment",
+                                           covars = c("treatmentGiven","purity"))
+
+```
+
+```{r}
+library(ggplot2); library(ggrepel)
+
+plot_interaction_volcano <- function(tab_int, title = "Driver×Treatment (POST vs PRE)", k_label = 12){
+  df <- as.data.frame(tab_int); df$logFC <- as.numeric(df$logFC); df$adj.P.Val <- as.numeric(df$adj.P.Val)
+  gg <- ggplot(df, aes(logFC, -log10(adj.P.Val))) +
+    geom_point(alpha = 0.6, color = "grey65") +
+    geom_vline(xintercept = 0, linetype = 3) +
+    labs(x = "(Mut−WT in POST) − (Mut−WT in PRE)", y = "-log10 FDR", title = title) +
+    theme_minimal(base_size = 12)
+  ord <- order(df$adj.P.Val, na.last = NA)[seq_len(min(k_label, nrow(df)))]
+  gg + ggrepel::geom_text_repel(data = df[ord, ], aes(label = pathway), seed = 1, size = 3, max.overlaps = Inf)
+}
+```
+
+```{r}
+plot_interaction_volcano(res_rb1)
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
