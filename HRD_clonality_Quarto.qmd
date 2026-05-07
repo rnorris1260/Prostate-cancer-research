@@ -1,0 +1,1579 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+You can add options to executable code like this
+
+```{r}
+clonality_res_pc <- clonality_res[clonality_res$gene %in% prostate_genes, ] 
+```
+
+```{r}
+clonality_df <- clonality_res_pc %>%
+  mutate(
+    alteration = case_when(
+      event_type == "SNV" ~ "MUTATION",
+
+      total_cn >= 6 ~ "AMP",
+      total_cn >= 4 ~ "PARTIAL_AMP",
+
+      total_cn == 0 ~ "DEL",
+      total_cn <= 1 ~ "DEL",
+
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+```{r}
+driver_clonality <- clonality_df %>%
+  inner_join(
+    drivers_allIDs,
+    by = c(
+      "hmfPatientId",
+      "gene",
+      "alteration"
+    )
+  )
+```
+
+```{r}
+pat_summary_pc <- clonality_res_all_pc %>%
+  group_by(hmfPatientId, group) %>%
+  summarise(
+    n_events = n(),
+    n_subclonal = sum(clonality < 0.85),
+    prop_subclonal = n_subclonal / n_events
+  )
+```
+
+```{r}
+### Driver events per gene ### 
+library(dplyr)
+
+gene_order <- driver_clonality %>%
+  group_by(gene) %>%
+  summarise(median_clonality = median(clonality, na.rm = TRUE)) %>%
+  arrange(desc(median_clonality)) %>%
+  pull(gene)
+
+driver_clonality$gene <- factor(driver_clonality$gene, levels = gene_order)
+
+# remove partial amp
+driver_clonality <- driver_clonality[driver_clonality$alteration != "PARTIAL_AMP", ]
+
+ggplot(driver_clonality,
+       aes(x = reorder(gene, clonality, FUN = mean),
+           y = clonality,
+           fill = alteration)) +
+ # geom_violin(position = "identity", alpha = 0.6) +
+  geom_jitter(aes(color = alteration),
+              width = 0.2, alpha = 0.3) +
+  coord_flip() +
+  scale_y_reverse()
+```
+
+```{r}
+driver_clonality <- driver_clonality %>%
+  mutate(hr_status = ifelse(hmfPatientId %in% hr_def_pats, "HRD", "HRP"))
+
+```
+
+```{r}
+```
+
+```{r}
+driver_clonality$gene <- factor(
+  driver_clonality$gene,
+  levels = rev(sort(unique(driver_clonality$gene)))
+)
+
+driver_clonality <- driver_clonality %>%
+  mutate(
+    alteration = recode(alteration,
+      "SNV" = "SNV/SV"
+    )
+  )
+
+## MAIN PLOT 1
+ggplot(driver_clonality,
+       aes(x = gene,
+           y = clonality,
+           color = alteration)) +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  coord_flip() +
+  scale_y_reverse() +
+  facet_wrap(~ hr_status, ncol = 1)
+```
+
+```{r}
+RB1_pats <- unique(clonality_res_RB1$hmfPatientId)
+
+driver_clonality <- driver_clonality %>%
+  mutate(RB1_status = ifelse(hmfPatientId %in% RB1_pats, "alt", "wt"))
+
+ggplot(driver_clonality,
+       aes(x = reorder(gene, clonality, FUN = mean),
+           y = clonality,
+           fill = alteration)) +
+ # geom_violin(position = "identity", alpha = 0.6) +
+  geom_jitter(aes(color = alteration),
+              width = 0.2, alpha = 0.3) +
+  coord_flip() +
+  scale_y_reverse() +
+  facet_wrap(~ RB1_status, ncol = 1)
+```
+
+```{r}
+driver_clonality <- driver_clonality %>%
+  mutate(
+    RB1_TP53_status = case_when(
+      hmfPatientId %in% RB1_pats & hmfPatientId %in% TP53_pats ~ "RB1+TP53",
+      hmfPatientId %in% RB1_pats ~ "RB1_only",
+      hmfPatientId %in% TP53_pats ~ "TP53_only",
+      TRUE ~ "WT"
+    )
+  )
+
+ggplot(driver_clonality,
+       aes(x = reorder(gene, clonality, FUN = mean),
+           y = clonality,
+           fill = alteration)) +
+ # geom_violin(position = "identity", alpha = 0.6) +
+  geom_jitter(aes(color = alteration),
+              width = 0.2, alpha = 0.3) +
+  coord_flip() +
+  scale_y_reverse() +
+  facet_wrap(~ RB1_TP53_status, ncol = 1)
+```
+
+```{r}
+# patient-wise RB1 vs TP53
+library(dplyr)
+library(ggplot2)
+
+pat_clon <- driver_clonality %>%
+  mutate(
+    RB1_TP53_status = case_when(
+      hmfPatientId %in% RB1_pats & hmfPatientId %in% TP53_pats ~ "RB1+TP53",
+      hmfPatientId %in% RB1_pats ~ "RB1",
+      hmfPatientId %in% TP53_pats ~ "TP53",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(RB1_TP53_status)) %>%
+  group_by(hmfPatientId, RB1_TP53_status) %>%
+  summarise(
+    mean_clonality = mean(clonality, na.rm = TRUE),
+    median_clonality = median(clonality, na.rm = TRUE),
+    prop_subclonal = mean(clonality < 0.9, na.rm = TRUE),
+    n_events = n(),
+    .groups = "drop"
+  )
+
+ggplot(pat_clon, aes(x = RB1_TP53_status, y = prop_subclonal)) +
+  geom_violin(fill = "grey90", alpha = 0.8, trim = FALSE) +
+  geom_boxplot(width = 0.15, outlier.shape = NA) +
+  geom_jitter(width = 0.12, alpha = 0.7, size = 2) +
+  labs(
+    x = NULL,
+    y = "Proportion subclonal per patient",
+    title = "Patient-wise subclonality in RB1 vs TP53 altered tumours"
+  ) +
+  theme_bw()
+
+# MAIN PLOT 2
+ggplot(pat_clon, aes(x = RB1_TP53_status, y = prop_subclonal)) +
+  geom_violin(aes(fill = RB1_TP53_status), alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white") +
+  geom_jitter(aes(color = RB1_TP53_status), width = 0.12, alpha = 0.8, size = 2) +
+  scale_fill_manual(values = c(
+    "RB1" = "#1f78b4",
+    "TP53" = "#e31a1c",
+    "RB1+TP53" = "#6a3d9a"
+  )) +
+  scale_color_manual(values = c(
+    "RB1" = "#1f78b4",
+    "TP53" = "#e31a1c",
+    "RB1+TP53" = "#6a3d9a"
+  )) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = NULL,
+    y = "Proportion subclonal per patient",
+    title = "Patient-wise subclonality in RB1 vs TP53 altered tumours"
+  ) +
+  theme_bw()
+```
+
+```{r}
+## statistical test
+wilcox.test(clonality ~ hr_status, data = driver_clonality)
+```
+
+```{r}
+library(glmmTMB)
+
+model <- glmmTMB(
+  clonality ~ hr_status + alteration + (1 | gene),
+  family = beta_family(),
+  data = driver_clonality
+)
+```
+
+There is a cler difference between subclonality in HRD vs HRP but most atients in both groups still have mostly clonal alterations. So how can we figure out what makes a tumour have subclonal alterations?
+
+```{r}
+## separate clonal and subclonal 
+
+driver_clonality <- driver_clonality %>%
+  mutate(TP53_status = ifelse(hmfPatientId %in% TP53_pats, "alt", "wt"))
+
+meta_purity <- metadata[, c(2,4)]
+
+driver_clonality <- left_join(driver_clonality, meta_purity, by = "hmfPatientId")
+```
+
+```{r}
+driver_clonality <- driver_clonality %>%
+  mutate(
+    purity_group = case_when(
+      tumorPurity < 0.5 ~ "Low (<0.5)",
+      tumorPurity < 0.7 ~ "Medium (0.5–0.7)",
+      TRUE ~ "High (>0.7)"
+    )
+  )
+
+ggplot(driver_clonality,
+       aes(x = clonality, y = gene, color = alteration)) +
+  geom_point(alpha = 0.7) +
+  facet_grid(purity_group ~ hr_status) +
+  scale_x_reverse() +
+  theme_bw()
+```
+
+```{r}
+## has subclonal
+
+pat_level <- driver_clonality %>%
+  group_by(hmfPatientId) %>%
+  summarise(
+    has_subclonal = any(clonality < 0.9, na.rm = TRUE),
+    prop_subclonal = mean(clonality < 0.9, na.rm = TRUE),
+    tumorPurity = first(tumorPurity),
+    hr_status = first(hr_status),
+    TP53_status = first(TP53_status),
+    RB1_status = first(RB1_status),
+    .groups = "drop"
+  )
+
+library(logistf)
+
+pat_level <- pat_level %>%
+  mutate(
+    has_subclonal = factor(has_subclonal,
+                           levels = c(FALSE, TRUE),
+                           labels = c("No", "Yes"))
+  )
+
+model_firth <- logistf(
+  has_subclonal ~ hr_status + TP53_status,
+  data = pat_level
+)
+
+## does HRD suppress subclonality even when TP53 is altered
+logistf(
+  has_subclonal ~ hr_status * TP53_status + tumorPurity,
+  data = pat_level
+)
+```
+
+```{r}
+library(ggeffects)
+
+
+pred <- ggpredict(model_firth, terms = c("hr_status", "TP53_status"))
+
+plot(pred)
+```
+
+```{r}
+## can we show that even in the presence of TP53 or RB1 alterations HRD are still clonally restricted?
+
+
+library(dplyr)
+library(ggplot2)
+
+# make sure the grouping column exists
+pat_plot <- pat_level %>%
+  mutate(
+    group_TP53 = case_when(
+      hr_status == "HRD" & TP53_status == "wt"  ~ "HRD / TP53 wt",
+      hr_status == "HRD" & TP53_status == "alt" ~ "HRD / TP53 altered",
+      hr_status == "HRP" & TP53_status == "wt"  ~ "HRP / TP53 wt",
+      hr_status == "HRP" & TP53_status == "alt" ~ "HRP / TP53 altered"
+    ),
+    group_TP53 = factor(
+      group_TP53,
+      levels = c(
+        "HRD / TP53 wt",
+        "HRD / TP53 altered",
+        "HRP / TP53 wt",
+        "HRP / TP53 altered"
+      )
+    )
+  )
+
+# colours
+fill_cols <- c(
+  "HRD / TP53 wt" = "#4F81BD",
+  "HRD / TP53 altered" = "#7EA6E0",
+  "HRP / TP53 wt" = "#F4A259",
+  "HRP / TP53 altered" = "#D95F5F"
+)
+
+line_cols <- c(
+  "HRD / TP53 wt" = "#163A8C",
+  "HRD / TP53 altered" = "#4F81BD",
+  "HRP / TP53 wt" = "#E66A00",
+  "HRP / TP53 altered" = "#C62828"
+)
+
+# sample sizes for axis labels
+group_counts <- table(pat_plot$group_TP53)
+
+group_labels <- paste0(
+  names(group_counts),
+  "\n(n = ", group_counts, ")"
+)
+
+names(group_labels) <- names(group_counts)
+
+ggplot(pat_plot, aes(x = group_TP53, y = prop_subclonal)) +
+  # boxplot
+  geom_boxplot(
+    aes(fill = group_TP53, colour = group_TP53),
+    width = 0.42,
+    outlier.shape = NA,
+    alpha = 0.22,
+    size = 0.8
+  ) +
+  
+  # jittered points
+  geom_jitter(
+    aes(colour = group_TP53),
+    width = 0.14,
+    height = 0,
+    alpha = 0.75,
+    size = 2
+  ) +
+  
+  # mean point
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    colour = "black",
+    fill = "black",
+    shape = 21,
+    size = 3.8
+  ) +
+  
+  # mean +/- normal CI
+  stat_summary(
+    fun.data = mean_cl_normal,
+    geom = "errorbar",
+    colour = "black",
+    width = 0.10,
+    size = 0.7
+  ) +
+  
+  scale_fill_manual(values = fill_cols) +
+  scale_colour_manual(values = line_cols) +
+  scale_x_discrete(labels = group_counts) +
+  
+  coord_cartesian(ylim = c(0, 1.02), clip = "off") +
+  
+  labs(
+    #title = "HRD tumours remain clonally restricted even when TP53 is altered",
+    x = NULL,
+    y = "Proportion of subclonal alterations"
+  ) +
+  
+  scale_x_discrete(labels = group_labels) +
+  
+  theme_classic(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    axis.title.y = element_text(size = 15),
+    axis.text.x = element_text(
+      angle = 18,
+      hjust = 1,
+      vjust = 1,
+      size = 12,
+      face = "bold"
+    ),
+    legend.position = "none",
+    axis.line.x = element_line(linewidth = 0.8),
+    axis.line.y = element_line(linewidth = 0.8)
+  )
+```
+
+```{r}
+meta_unique_rna_all <- read.csv("~/clonality/meta_unique_rna_all.csv")
+meta_RB1_loss <- meta_unique_rna_all[, c(3,16)]
+
+pat_level <- pat_level %>%
+  mutate(
+    evolution_state = case_when(
+      prop_subclonal == 0 ~ "clonal",
+      prop_subclonal < 0.3 ~ "low_subclonal",
+      prop_subclonal < 0.7 ~ "intermediate",
+      TRUE ~ "high_subclonal"
+    )
+  )
+
+pat_level <- left_join(pat_level, meta_RB1_loss, by = "hmfPatientId")
+
+ggplot(pat_level, aes(x = evolution_state, y = score_RB1_loss)) +
+  geom_violin(fill = "grey90") +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  theme_bw()
+```
+
+We have shown that HRD restricts subclonality, and that this holds when tumour purity is taken into account, but what makes an HRP tumour develop subclonal alterations
+
+```{r}
+hrp_pat <- pat_level %>%
+  filter(hr_status == "HRP")
+
+glm(has_subclonal ~ TP53_status + RB1_status + tumorPurity,
+    family = binomial(), data = hrp_pat)
+```
+
+```{r}
+hrp_pat <- hrp_pat %>%
+  mutate(
+    RB1_TP53_group = case_when(
+      TP53_status == "alt" & RB1_status == "alt" ~ "TP53+RB1",
+      TP53_status == "alt" ~ "TP53",
+      RB1_status == "alt" ~ "RB1",
+      TRUE ~ "WT"
+    )
+  )
+
+ggplot(hrp_pat, aes(x = RB1_TP53_group, fill = factor(has_subclonal))) +
+  geom_bar(position = "fill")
+```
+
+```{r}
+# treatment
+meta_tx_timing <- meta_full[, c(2,12,18)]
+names(meta_tx_timing)[c(2,3)] <- c("biopsyDate", "treatmentStartDate")
+meta_tx_timing <- meta_tx_timing[-c(1:10),]
+
+meta_tx_timing$biopsy2tx <- as.Date(meta_tx_timing$biopsyDate) - as.Date(meta_tx_timing$treatmentStartDate)
+
+library(dplyr)
+library(stringr)
+
+meta_tx_timing <- meta_tx_timing %>%
+  mutate(
+    biopsy2tx = str_remove(biopsy2tx, " days"),
+    biopsy2tx = as.integer(biopsy2tx)
+  )
+
+# group timing between biopsy and treratment
+meta_tx_timing <- meta_tx_timing %>%
+  mutate(
+    tx_timing_group = case_when(
+      is.na(biopsy2tx) ~ NA_character_,
+      biopsy2tx < 1 ~ "Pre-treatment",
+#      biopsy2tx >= -60 & biopsy2tx < -14 ~ "Pre-treatment (near)",
+      biopsy2tx >= 1 & biopsy2tx <= 14 ~ "Peri-treatment",
+      biopsy2tx > 14 & biopsy2tx <= 90 ~ "Early post-treatment",
+      biopsy2tx > 90 ~ "Late post-treatment"
+    )
+  )
+
+driver_clonality_tx <- left_join(
+  driver_clonality, meta_tx_timing,
+  by = "hmfPatientId"
+)
+
+ggplot(driver_clonality_tx,
+       aes(x = gene,
+           y = clonality,
+           color = tx_timing_group)) +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  coord_flip() +
+  scale_y_reverse() +
+  facet_wrap(~ hr_status, ncol = 1)
+
+lm(clonality ~ tx_timing_group * hr_status + tumorPurity,
+    data = driver_clonality_tx)
+```
+
+```{r}
+## patient-level
+patient_clonality_tx <- driver_clonality_tx %>%
+  group_by(hmfPatientId, tx_timing_group, hr_status) %>%
+  summarise(
+    mean_clonality = mean(clonality, na.rm = TRUE),
+    prop_subclonal = mean(clonality < 0.85, na.rm = TRUE),
+    tumorPurity = first(tumorPurity)
+  )
+
+lm(mean_clonality ~ tx_timing_group * hr_status + tumorPurity,
+   data = patient_clonality_tx)
+
+library(ggplot2)
+library(dplyr)
+
+patient_clonality_tx <- patient_clonality_tx %>%
+  mutate(
+    tx_timing_group = factor(
+      tx_timing_group,
+      levels = c("Pre-treatment", "Peri-treatment", "Late post-treatment")
+    )
+  )
+
+library(ggeffects)
+
+patient_clonality_tx <- patient_clonality_tx %>%
+  mutate(mean_subclonality = 1 - mean_clonality)
+
+fit <- lm(mean_subclonality ~ tx_timing_group * hr_status + tumorPurity,
+          data = patient_clonality_tx)
+
+pred <- ggpredict(fit, terms = c("tx_timing_group", "hr_status"))
+
+ggplot(pred, aes(x = x, y = predicted, colour = group, group = group)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1) +
+  coord_cartesian(ylim = c(0, 1)) +
+  geom_errorbar(aes(
+  ymin = conf.low,
+  ymax = pmin(conf.high, 1)
+), width = 0.1) +
+  labs(
+    x = "Timing of biopsy relative to treatment start",
+    y = "Adjusted mean clonality",
+    colour = "HR status"
+  ) +
+  theme_classic()
+```
+
+```{r}
+### what happens if we separate CNV
+clonality_res_all_pcCNV <- clonality_res_all_pc[clonality_res_all_pc$event_type == "CNV", ]
+pat_summary_pcCNV <- clonality_res_all_pcCNV %>%
+  group_by(hmfPatientId, group) %>%
+  summarise(
+    n_events = n(),
+    n_subclonal = sum(clonality < 0.85),
+    prop_subclonal = n_subclonal / n_events
+  )
+```
+
+```{r}
+### CNV ###
+
+ggplot(pat_summary_pcCNV, aes(x = group, y = prop_subclonal, color = group)) +
+  geom_violin(trim = TRUE, alpha = 0.3) +
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.4, size = 1) +
+  theme_bw() +
+  labs(y = "Proportion subclonal events", x = NULL)
+```
+
+```{r}
+ggplot(pat_summary_pcCNV, aes(x = group, y = prop_subclonal, color = group)) +
+  geom_jitter(width = 0.08, alpha = 0.5, size = 1.5) +
+  stat_summary(fun = median, geom = "point", size = 3, color = "black") +
+  stat_summary(fun.data = mean_cl_boot, geom = "errorbar", width = 0.2, color = "black") +
+  theme_bw() +
+  labs(y = "Proportion subclonal CNV events", x = NULL)
+```
+
+```{r}
+## focus on  non-zero in CNV
+```
+
+```{r}
+ggplot(pat_summary_pcCNV, aes(x = prop_subclonal, color = group)) +
+  stat_ecdf(size = 1) +
+  theme_bw() +
+  labs(x = "Proportion subclonal CNV events",
+       y = "Cumulative fraction of patients")
+```
+
+```{r}
+ggplot(pat_summary_pcCNV, aes(x = group, y = prop_subclonal + 1e-4, color = group)) +
+  geom_jitter(width = 0.08, alpha = 0.5) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(y = "Log10 proportion subclonal CNV events", x = NULL)
+```
+
+If we focus on CNV, the signal dssapears, so is all the signal in SNV?
+
+```{r}
+### SNV ###
+clonality_res_all_pcSNV <- clonality_res_all_pc[clonality_res_all_pc$event_type == "SNV", ]
+
+pat_summary_pcSNV <- clonality_res_all_pcSNV %>%
+  group_by(hmfPatientId, group) %>%
+  summarise(
+    n_events = n(),
+    n_subclonal = sum(clonality < 0.85),
+    prop_subclonal = n_subclonal / n_events
+  )
+
+ggplot(pat_summary_pcSNV, aes(x = group, y = prop_subclonal, color = group)) +
+  geom_violin(trim = TRUE, alpha = 0.3) +
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.4, size = 1) +
+  theme_bw() +
+  labs(y = "Proportion subclonal events", x = NULL)
+```
+
+HRD specifically constrains **SNV-based subclonal diversification**, while CNV dynamics remain comparable across groups
+
+```{r}
+## glm
+
+pat_summary_pc <- pat_summary_pc %>%
+  mutate(
+    n_clonal = n_events - n_subclonal
+  )
+
+fit_binom <- glm(
+  cbind(n_subclonal, n_clonal) ~ group,
+  family = binomial,
+  data = pat_summary_pc
+)
+
+summary(fit_binom)
+```
+
+```{r}
+## quasi binomial
+
+fit_qbinom <- glm(
+  prop_subclonal ~ group,
+  weights = n_events,
+  family = quasibinomial,
+  data = pat_summary_pc
+)
+
+summary(fit_qbinom)
+```
+
+```{r}
+pat_summary_pc %>%
+  group_by(group) %>%
+  summarise(prop_any = mean(n_subclonal > 0))
+```
+
+```{r}
+glm(cbind(n_subclonal, n_clonal) ~ group, data = pat_summary_pc, family = binomial)
+```
+
+```{r}
+## two-part modell
+pat_summary_pc <- pat_summary_pc %>%
+  mutate(has_subclonal = n_subclonal > 0)
+
+fit_any <- glm(
+  has_subclonal ~ group,
+  family = binomial,
+  data = pat_summary_pc
+)
+
+summary(fit_any)
+```
+
+```{r}
+fit_nonzero <- glm(
+  prop_subclonal ~ group,
+  weights = n_events,
+  family = quasibinomial,
+  data = subset(pat_summary_pc, n_subclonal > 0)
+)
+
+summary(fit_nonzero)
+```
+
+```         
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(stringr)
+
+clonal_cutoff <- 0.85
+
+ev_pc <- clonality_res_all_pcSNV %>%
+  mutate(
+    subclonal = clonality < clonal_cutoff,
+    gene = toupper(gene)
+  )
+
+
+## add pathway
+pathmap2 <- pathmap %>%
+  transmute(
+    gene = toupper(gene),
+    pathway = pathway
+  ) %>%
+  distinct()
+
+ev_pc <- ev_pc %>%
+  left_join(pathmap2, by = "gene")
+```
+
+For each patient-gene pair, ask: did this patient have that gene subclonally altered at least once?
+
+```{r}
+gene_patient <- ev_pc %>%
+  filter(!is.na(gene), gene != "") %>%
+  group_by(hmfPatientId, group, gene) %>%
+  summarise(
+    has_subclonal_gene = any(subclonal, na.rm = TRUE),
+    n_subclonal_gene_events = sum(subclonal, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# summarise to group level
+gene_group_summary <- gene_patient %>%
+  group_by(group, gene) %>%
+  summarise(
+    n_patients_with_subclonal = sum(has_subclonal_gene),
+    .groups = "drop"
+  )
+
+group_sizes <- ev_pc %>%
+  distinct(hmfPatientId, group) %>%
+  count(group, name = "n_patients")
+
+gene_group_summary <- gene_group_summary %>%
+  left_join(group_sizes, by = "group") %>%
+  mutate(prop_patients_subclonal = n_patients_with_subclonal / n_patients)
+
+# get present in HRp/TP53 and not in HRD
+gene_wide <- gene_group_summary %>%
+  select(group, gene, prop_patients_subclonal, n_patients_with_subclonal) %>%
+  pivot_wider(
+    names_from = group,
+    values_from = c(prop_patients_subclonal, n_patients_with_subclonal),
+    values_fill = 0
+  )
+
+gene_candidates <- gene_wide %>%
+  mutate(
+    enrich_vs_hrd_hrp  = prop_patients_subclonal_HRP  - prop_patients_subclonal_HRD,
+    enrich_vs_hrd_tp53 = prop_patients_subclonal_TP53 - prop_patients_subclonal_HRD,
+    mean_nonhrd = (prop_patients_subclonal_HRP + prop_patients_subclonal_TP53) / 2,
+    contrast_score = mean_nonhrd - prop_patients_subclonal_HRD
+  ) %>%
+  arrange(desc(contrast_score))
+
+gene_candidates_strict <- gene_candidates %>%
+  filter(
+    prop_patients_subclonal_HRD == 0,
+    (prop_patients_subclonal_HRP >= 0.05 | prop_patients_subclonal_TP53 >= 0.05)
+  ) %>%
+  arrange(desc(contrast_score))
+
+## plot
+top_genes <- gene_candidates %>%
+  slice_max(order_by = contrast_score, n = 20)
+
+plot_dat_gene <- gene_group_summary %>%
+  semi_join(top_genes, by = "gene") %>%
+  mutate(gene = fct_reorder(gene, prop_patients_subclonal, .fun = max))
+
+ggplot(plot_dat_gene, aes(x = gene, y = prop_patients_subclonal, fill = group)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = NULL,
+    y = "Proportion of patients with subclonal alteration",
+    title = "Genes subclonally altered in HRP/TP53 but rare or absent in HRD"
+  )
+```
+
+![](images/clipboard-2833775796.png)
+
+```{r}
+## pathway level
+pathway_patient <- ev_pc %>%
+  filter(!is.na(pathway), pathway != "") %>%
+  group_by(hmfPatientId, group, pathway) %>%
+  summarise(
+    has_subclonal_pathway = any(subclonal, na.rm = TRUE),
+    n_subclonal_pathway_events = sum(subclonal, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pathway_group_summary <- pathway_patient %>%
+  group_by(group, pathway) %>%
+  summarise(
+    n_patients_with_subclonal = sum(has_subclonal_pathway),
+    .groups = "drop"
+  ) %>%
+  left_join(group_sizes, by = "group") %>%
+  mutate(prop_patients_subclonal = n_patients_with_subclonal / n_patients)
+
+pathway_wide <- pathway_group_summary %>%
+  select(group, pathway, prop_patients_subclonal, n_patients_with_subclonal) %>%
+  pivot_wider(
+    names_from = group,
+    values_from = c(prop_patients_subclonal, n_patients_with_subclonal),
+    values_fill = 0
+  )
+
+pathway_candidates <- pathway_wide %>%
+  mutate(
+    mean_nonhrd = (prop_patients_subclonal_HRP + prop_patients_subclonal_TP53) / 2,
+    contrast_score = mean_nonhrd - prop_patients_subclonal_HRD
+  ) %>%
+  arrange(desc(contrast_score))
+
+top_pathways <- pathway_candidates %>%
+  filter(
+    prop_patients_subclonal_HRD == 0,
+    (prop_patients_subclonal_HRP >= 0.05 | prop_patients_subclonal_TP53 >= 0.05)
+  ) %>%
+  slice_max(order_by = contrast_score, n = 15)
+
+plot_dat_pathway <- pathway_group_summary %>%
+  semi_join(top_pathways, by = "pathway") %>%
+  mutate(pathway = fct_reorder(pathway, prop_patients_subclonal, .fun = max))
+
+ggplot(plot_dat_pathway, aes(x = pathway, y = prop_patients_subclonal, fill = group)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = NULL,
+    y = "Proportion of patients with subclonal pathway alteration",
+    title = "Pathways with subclonal alterations in HRP/TP53 but not HRD")
+```
+
+```{r}
+all_patients <- ev_pc %>%
+  distinct(hmfPatientId, group)
+
+all_genes <- ev_pc %>%
+  filter(!is.na(gene), gene != "") %>%
+  distinct(gene)
+
+gene_patient_full <- tidyr::crossing(all_patients, all_genes) %>%
+  left_join(gene_patient, by = c("hmfPatientId", "group", "gene")) %>%
+  mutate(
+    has_subclonal_gene = ifelse(is.na(has_subclonal_gene), FALSE, has_subclonal_gene))
+```
+
+![](images/clipboard-1460078602.png)
+
+```{r}
+
+## HRD vs nonHRD
+gene_fisher <- gene_patient_full %>%
+  mutate(nonhrd = ifelse(group == "HRD", "HRD", "nonHRD")) %>%
+  group_by(gene) %>%
+  summarise(
+    hrd_yes    = sum(has_subclonal_gene & nonhrd == "HRD"),
+    hrd_no     = sum(!has_subclonal_gene & nonhrd == "HRD"),
+    nonhrd_yes = sum(has_subclonal_gene & nonhrd == "nonHRD"),
+    nonhrd_no  = sum(!has_subclonal_gene & nonhrd == "nonHRD"),
+    p_value = fisher.test(matrix(
+      c(hrd_yes, hrd_no, nonhrd_yes, nonhrd_no),
+      nrow = 2
+    ))$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    padj = p.adjust(p_value, method = "BH")
+  ) %>%
+  left_join(gene_candidates, by = "gene") %>%
+  arrange(padj, desc(contrast_score))
+
+gene_fisher %>%
+  select(
+    gene, hrd_yes, nonhrd_yes, p_value, padj,
+    starts_with("prop_patients_subclonal"),
+    contrast_score
+  ) %>%
+  head(30)
+```
+
+HRD shows a broad reduction in subclonal burden, rather than a strongly gene-specific depletion signal detectable one gene at a time.
+
+HRD tumours are not globally less evolutionary, but specifically exhibit reduced ongoing SNV-driven diversification, consistent with an early mutational burst followed by constrained evolutionary branching.
+
+```{r}
+ggplot(pat_summary_pcCNV, aes(x = prop_subclonal, color = group)) +
+  stat_ecdf(size = 1) +
+  theme_bw() +
+  labs(x = "Proportion subclonal CNV events",
+       y = "Cumulative fraction of patients")
+```
+
+![](images/clipboard-1430909299.png)
+
+CNV subclonality is rare across all groups, with only modest differences in frequency and no clear separation in magnitude.
+
+ECDF = Empirical Cumulative Distribution Function
+
+```{r}
+##
+library(dplyr)
+library(ggplot2)
+
+ecdf_dat <- bind_rows(
+  pat_summary_pcSNV %>%
+    mutate(event_type = "SNV"),
+  pat_summary_pcCNV %>%
+    mutate(event_type = "CNV")
+)
+
+ggplot(ecdf_dat, aes(x = prop_subclonal, color = group)) +
+  stat_ecdf(linewidth = 1) +
+  facet_wrap(~ event_type, nrow = 1) +
+  coord_cartesian(xlim = c(0, 0.5)) +
+  theme_bw() +
+  labs(
+    x = "Proportion subclonal events",
+    y = "Cumulative fraction of patients",
+    color = "Group"
+  )
+```
+
+![](images/clipboard-3594523030.png)
+
+```{r}
+ggplot(ecdf_dat, aes(x = prop_subclonal, color = group)) +
+  stat_ecdf(linewidth = 1) +
+  facet_wrap(~ event_type, nrow = 1) +
+  coord_cartesian(xlim = c(0, 0.3)) +
+  theme_bw(base_size = 12) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "right"
+  ) +
+  labs(
+    x = "Proportion subclonal events per patient",
+    y = "Cumulative fraction of patients",
+    color = "Group"
+  )
+```
+
+![](images/clipboard-707162028.png)
+
+HRD may actually have *lower probability* of SNV subclonality
+
+```{r}
+
+```
+
+HRD tumours show reduced SNV-driven subclonal evolution, both in the probability of harbouring subclonal mutations and in their extent, while CNV subclonality remains comparatively similar across groups.
+
+HRD constrains SNV diversification at multiple levels (initiation and expansion), while leaving CNV dynamics largely intact.
+
+Take-home
+
+HRD tumours exhibit a marked reduction in SNV-based subclonal evolution—both in the likelihood of subclonal mutations and their accumulation—while CNV subclonality remains largely comparable across groups.
+
+HRD tumours look genomically chaotic, but evolutionarily simple—most of the damage happens early and gets locked in
+
+Before we go any further though, we need to check if the differences in subclonality between HRD and TP53 hold when we control for TP53 alterations as several of the HRD patients have an alteration in TP53
+
+```{r}
+pat_summary_pcSNV <- pat_summary_pcSNV %>%
+  mutate(has_subclonal = prop_subclonal > 0)
+glm(prop_subclonal ~ group, data = pat_summary_pcSNV, family = binomial)
+
+## if I use has_subclonal - not much difference
+## if I use proportion subclonal ~15x difference!
+
+# add TP53 status
+pat_summary_pcSNV <- pat_summary_pcSNV %>%
+  mutate(TP53_status = ifelse(hmfPatientId %in% TP53_pats, "alt", "wt"))
+
+glm(prop_subclonal ~ group * TP53_status, data = pat_summary_pcSNV, family="binomial")
+
+glm(cbind(n_subclonal, n_events - n_subclonal) ~ group * TP53_status, data = pat_summary_pcSNV, family = binomial)
+
+glm(prop_subclonal ~ group * TP53_status, data = pat_summary_pcSNV, family="quasibinomial")
+
+## plot to make results (and influence of TP53) clearer
+library(ggplot2)
+
+ggplot(pat_summary_pcSNV,
+       aes(x = group, y = prop_subclonal, color = TP53_status)) +
+  geom_violin(trim = TRUE, alpha = 0.25, position = position_dodge(width = 0.8)) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8),
+              alpha = 0.4, size = 1) +
+  theme_bw() +
+  labs(y = "Proportion subclonal SNVs", x = NULL)
+
+# or log2 scale
+ggplot(pat_summary_pcSNV,
+       aes(x = group, y = prop_subclonal + 1e-4, color = TP53_status)) +
+  geom_violin(trim = TRUE, alpha = 0.25, position = position_dodge(width = 0.8)) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8),
+              alpha = 0.4, size = 1) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(y = "Proportion subclonal SNVs (log scale)", x = NULL)
+```
+
+```{r}
+## model predicted means
+library(dplyr)
+
+newdata <- expand.grid(
+  group = levels(pat_summary_pcSNV$group),
+  TP53_status = levels(pat_summary_pcSNV$TP53_status)
+)
+
+newdata$pred <- predict(
+  glm(prop_subclonal ~ group + TP53_status,
+      family = "binomial",
+      data = pat_summary_pcSNV),
+  newdata = newdata,
+  type = "response"
+)
+
+ggplot(newdata,
+       aes(x = group, y = pred, fill = TP53_status)) +
+  geom_col(position = "dodge") +
+  theme_bw() +
+  labs(y = "Predicted proportion subclonal SNVs", x = NULL)
+```
+
+```{r}
+##### THIS IS THE BEST ONE!!
+ggplot(pat_summary_pcSNV,
+       aes(x = group, y = prop_subclonal, color = TP53_status)) +
+  geom_jitter(width = 0.12, size = 2.2, alpha = 0.8) +
+  scale_y_log10() +
+  scale_color_manual(values = c(
+    "alt" = "#D55E00",   # strong orange/red
+    "wt"  = "#0072B2"    # strong blue
+  )) +
+  theme_bw(base_size = 13) +
+  labs(
+    y = "Proportion subclonal SNVs (log scale)",
+    x = NULL,
+    color = "TP53 status"
+  )
+```
+
+```{r}
+pat_summary_pcCNV <- pat_summary_pcCNV %>%
+  mutate(TP53_status = ifelse(hmfPatientId %in% TP53_pats, "alt", "wt"))
+
+ggplot(pat_summary_pcCNV,
+       aes(x = group, y = prop_subclonal, color = TP53_status)) +
+  geom_jitter(width = 0.12, size = 2.2, alpha = 0.8) +
+  scale_y_log10() +
+  scale_color_manual(values = c(
+    "alt" = "#D55E00",   # strong orange/red
+    "wt"  = "#0072B2"    # strong blue
+  )) +
+  theme_bw(base_size = 13) +
+  labs(
+    y = "Proportion subclonal SNVs (log scale)",
+    x = NULL,
+    color = "TP53 status"
+  )
+```
+
+So far we've used the gene summaries which focus the analysis on pc driver gene events. But at this point it would be interesting to go back to the full clonality_res and see if the pattern still holds
+
+```{r}
+pat_summary_full <- clonality_res %>%
+  filter(!is.na(clonality), !is.na(hmfPatientId)) %>%
+  mutate(
+    clonality_class = if_else(clonality >= 0.85, "clonal", "subclonal")
+  ) %>%
+  group_by(hmfPatientId, event_type) %>%
+  summarise(
+    n_events = n(),
+    n_subclonal = sum(clonality_class == "subclonal"),
+    prop_subclonal = n_subclonal / n_events,
+    .groups = "drop"
+  )
+```
+
+```{r}
+## plot
+library(dplyr)
+library(ggplot2)
+
+pat_summary_HRD <- pat_summary_full[pat_summary_full$hmfPatientId %in% hr_def_pats, ]
+pat_summary_HRD$group <- "HRD"
+pat_summary_HRP <- pat_summary_full[!pat_summary_full$hmfPatientId %in% hr_def_pats, ]
+pat_summary_HRP$group <- "HRP"
+pat_summary_TP53 <- pat_summary_full[pat_summary_full$hmfPatientId %in% TP53_pats, ]
+pat_summary_TP53$group <- "TP53"
+
+pat_summary_full_plot <- rbind(pat_summary_HRD, pat_summary_HRP, pat_summary_TP53)
+
+pat_summary_full_plot$group <- factor(pat_summary_full_plot$group, 
+                                      levels = c("HRD", "HRP", "TP53"))
+
+ggplot(pat_summary_full_plot, aes(x = group, y = prop_subclonal, colour = group)) +
+  geom_boxplot(width = 0.35, outlier.shape = NA, alpha = 0.15) +
+  geom_jitter(aes(size = n_events), width = 0.12, height = 0, alpha = 0.85) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = NULL,
+    y = "Subclonal events / all events",
+    size = "Total events",
+    title = "Patient-level subclonal burden across groups"
+  ) +
+  theme_bw() +
+  theme(legend.position = "right")
+```
+
+```{r}
+ggplot(pat_summary_full_plot, aes(x = group, y = n_subclonal, colour = group)) +
+  geom_boxplot(width = 0.35, outlier.shape = NA, alpha = 0.15) +
+  geom_jitter(width = 0.12, height = 0, alpha = 0.85, size = 2.8) +
+  labs(
+    x = NULL,
+    y = "Number of subclonal events",
+    title = "Patient-level subclonal event counts across groups"
+  ) +
+  theme_bw()
+```
+
+```{r}
+library(ggbeeswarm)
+
+ggplot(pat_summary_full_plot, aes(x = group, y = prop_subclonal, colour = group)) +
+  geom_boxplot(width = 0.3, outlier.shape = NA, alpha = 0.12) +
+  geom_quasirandom(width = 0.18, alpha = 0.9, size = 2.8) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = NULL,
+    y = "Subclonal events / all events",
+    title = "Patient-level subclonal burden across groups"
+  ) +
+  theme_bw()
+```
+
+```{r}
+ggplot(pat_summary_pcSNV,
+       aes(x = prop_subclonal, fill = group)) +
+  geom_density(alpha = 0.4) +
+  theme_bw()
+```
+
+```{r}
+ggplot(pat_summary_pcSNV,
+       aes(x = group, y = prop_subclonal, color = group)) +
+  geom_jitter(width = 0.15, size = 2.5, alpha = 0.8) +
+  theme_bw()
+```
+
+```{r}
+ggplot(pat_summary_pcCNV,
+       aes(x = group, y = prop_subclonal, color = group)) +
+  geom_jitter(width = 0.15, size = 2.5, alpha = 0.8) +
+  theme_bw()
+```
+
+```{r}
+library(ggpubr)
+
+comparisons <- list(
+  c("HRD", "HRP"),
+  c("HRD", "TP53"),
+  c("HRP", "TP53")
+)
+
+n_df <- pat_summary_pcCNV %>%
+  group_by(group) %>%
+  summarise(n = n())
+
+pat_summary_pcCNV <- pat_summary_pcCNV %>%
+  left_join(n_df, by = "group") %>%
+  mutate(group_label = paste0(group, "\n(n=", n, ")"))
+```
+
+```{r}
+n_df <- pat_summary_pcSNV %>%
+  group_by(group) %>%
+  summarise(n = n())
+
+pat_summary_pcSNV <- pat_summary_pcSNV %>%
+  left_join(n_df, by = "group") %>%
+  mutate(group_label = paste0(group, "\n(n=", n, ")"))
+```
+
+```{r}
+ggplot(pat_summary_pcCNV,
+       aes(x = group_label, y = prop_subclonal, color = TP53_status)) +
+  geom_jitter(width = 0.12, size = 2.2, alpha = 0.8) +
+  scale_y_log10() +
+  scale_color_manual(values = c(
+    "alt" = "#D55E00",
+    "wt"  = "#0072B2"
+  )) +
+  theme_bw(base_size = 13) +
+  labs(
+    y = "Proportion subclonal SNVs (log scale)",
+    x = NULL,
+    color = "TP53 status"
+  ) +
+  stat_compare_means(method = "kruskal.test", label.y = 1) +
+  stat_compare_means(comparisons = comparisons,
+                     method = "wilcox.test",
+                     label = "p.signif")
+```
+
+```{r}
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+
+comparisons <- list(
+  c("HRD", "HRP"),
+  c("HRD", "TP53"),
+  c("HRP", "TP53")
+)
+
+# patient numbers
+n_df <- pat_summary_pcCNV %>%
+  count(group)
+
+x_labs <- setNames(
+  paste0(n_df$group, "\n(n=", n_df$n, ")"),
+  n_df$group
+)
+
+# small pseudocount for zeros so they can be shown on a log scale
+pat_summary_pcCNV_plot <- pat_summary_pcCNV %>%
+  mutate(
+    TP53_status = ifelse(hmfPatientId %in% TP53_pats, "alt", "wt"),
+    prop_subclonal_plot = ifelse(prop_subclonal == 0, 1e-3, prop_subclonal)
+  )
+
+ggplot(
+  pat_summary_pcCNV_plot,
+  aes(x = group, y = prop_subclonal_plot)
+) +
+  geom_boxplot(
+    aes(group = group),
+    outlier.shape = NA,
+    width = 0.55,
+    fill = "white",
+    color = "black",
+    alpha = 0.5
+  ) +
+  geom_jitter(
+    aes(color = TP53_status),
+    width = 0.12,
+    size = 2.2,
+    alpha = 0.8
+  ) +
+  scale_y_log10(
+    breaks = c(1e-3, 1e-2, 1e-1, 1),
+    labels = c("0", "0.01", "0.1", "1")
+  ) +
+  scale_x_discrete(labels = x_labs) +
+  scale_color_manual(
+    values = c(
+      "alt" = "#D55E00",
+      "wt"  = "#0072B2"
+    )
+  ) +
+  stat_compare_means(
+    aes(x = group, y = prop_subclonal_plot),
+    inherit.aes = FALSE,
+    method = "kruskal.test",
+    label.y = 1.15,
+    show.legend = FALSE
+  ) +
+  stat_compare_means(
+    aes(x = group, y = prop_subclonal_plot),
+    inherit.aes = FALSE,
+    comparisons = comparisons,
+    method = "wilcox.test",
+    label = "p.signif",
+    hide.ns = TRUE,
+    show.legend = FALSE
+  ) +
+  theme_bw(base_size = 13) +
+  labs(
+    y = "Proportion subclonal CNVs (log scale)",
+    x = NULL,
+    color = "TP53 status"
+  )
+```
+
+```{r}
+n_df <- pat_summary_pcSNV %>%
+  count(group)
+
+x_labs <- setNames(
+  paste0(n_df$group, "\n(n=", n_df$n, ")"),
+  n_df$group
+)
+
+# small pseudocount for zeros so they can be shown on a log scale
+pat_summary_pcSNV_plot <- pat_summary_pcSNV %>%
+  mutate(
+    TP53_status = ifelse(hmfPatientId %in% TP53_pats, "alt", "wt"),
+    prop_subclonal_plot = ifelse(prop_subclonal == 0, 1e-3, prop_subclonal)
+  )
+
+ggplot(
+  pat_summary_pcSNV_plot,
+  aes(x = group, y = prop_subclonal_plot)
+) +
+  geom_boxplot(
+    aes(group = group),
+    outlier.shape = NA,
+    width = 0.55,
+    fill = "white",
+    color = "black",
+    alpha = 0.5
+  ) +
+  geom_jitter(
+    aes(color = TP53_status),
+    width = 0.12,
+    size = 2.2,
+    alpha = 0.8
+  ) +
+  scale_y_log10(
+    breaks = c(1e-3, 1e-2, 1e-1, 1),
+    labels = c("0", "0.01", "0.1", "1")
+  ) +
+  scale_x_discrete(labels = x_labs) +
+  scale_color_manual(
+    values = c(
+      "alt" = "#D55E00",
+      "wt"  = "#0072B2"
+    )
+  ) +
+  stat_compare_means(
+    aes(x = group, y = prop_subclonal_plot),
+    inherit.aes = FALSE,
+    method = "kruskal.test",
+    label.y = 1.15,
+    show.legend = FALSE
+  ) +
+  stat_compare_means(
+    aes(x = group, y = prop_subclonal_plot),
+    inherit.aes = FALSE,
+    comparisons = comparisons,
+    method = "wilcox.test",
+    label = "p.signif",
+    hide.ns = TRUE,
+    show.legend = FALSE
+  ) +
+  theme_bw(base_size = 13) +
+  labs(
+    y = "Proportion subclonal SNVs (log scale)",
+    x = NULL,
+    color = "TP53 status"
+  )
+```
+
+```{r}
+pat_summary_pcSNV <- pat_summary_pcSNV %>%
+  mutate(any_subclonal = prop_subclonal > 0)
+
+table_test <- table(pat_summary_pcSNV$group,
+                    pat_summary_pcSNV$any_subclonal)
+
+chisq.test(table_test)
+```
+
+New approach:
+
+gene-level clonality → patient-level evolutionary phenotype → back to gene drivers
+
+```{r}
+library(dplyr)
+
+patient_clonality <- pat_clonality_all_filt %>%
+  group_by(hmfPatientId) %>%
+  summarise(
+    prop_subclonal = sum(has_subclonal, na.rm = TRUE) / sum(n_events, na.rm = TRUE),
+    prop_clonal    = sum(has_clonal, na.rm = TRUE) / sum(n_events, na.rm = TRUE),
+    mean_clonality = weighted.mean(mean_clonality, w = n_events, na.rm = TRUE),
+    n_events_total = sum(n_events, na.rm = TRUE),
+    tumorPurity    = first(tumorPurity),
+    tx_class       = first(tx_class),
+    group          = first(group)
+  ) %>%
+  ungroup()
+```
+
+```{r}
+
+```
+
+```{r}
+library(ggplot2)
+
+patient_clonality <- patient_clonality %>%
+  arrange(prop_subclonal) %>%
+  mutate(patient_rank = row_number())
+
+ggplot(patient_clonality, aes(x = patient_rank, y = prop_subclonal)) +
+  geom_point(alpha = 0.7) +
+  geom_line(alpha = 0.5) +
+  theme_classic() +
+  labs(
+    x = "Patients (ranked by subclonality)",
+    y = "Proportion of subclonal events",
+    title = "Patient-wise tumour subclonality spectrum"
+  )
+```
+
+most (\~125 patients have zero subclonality)
+
+```{r}
+patient_clonality <- patient_clonality %>%
+mutate(
+  evolution_state = case_when(
+    prop_subclonal == 0 ~ "Clonal_fixation",
+    prop_subclonal < 0.05 ~ "Near_clonal",
+    TRUE ~ "Subclonal"
+  )
+)
+```
+
+What differentiates patients with suubclonality from those with zero sc?
+
+```{r}
+patient_clonality %>%
+  group_by(evolution_state) %>%
+  summarise(
+    mean_purity = mean(tumorPurity, na.rm = TRUE),
+    mean_events = mean(n_events_total, na.rm = TRUE)
+  )
+```
+
+```{r}
+ggplot(patient_clonality, aes(x = evolution_state, y = n_events_total)) +
+  geom_boxplot()
+```
+
+What determines whether genomic instability leads to clonal fixation vs ongoing diversification?
+
+```{r}
+patient_clonality <- patient_clonality %>%
+  mutate(
+    evolution_mode = case_when(
+      prop_subclonal == 0 & n_events_total < 10000 ~ "Stable_clonal",
+      prop_subclonal == 0 & n_events_total >= 10000 ~ "Genomically_unstable_clonal",
+      prop_subclonal > 0 ~ "Subclonal_evolution"
+    )
+  )
+
+patient_clonality %>%
+  arrange(n_events_total) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(x = rank, y = n_events_total, color = evolution_mode)) +
+  geom_point() +
+  scale_y_log10() +
+  theme_classic()
+```
+
+Event burden and subclonality are correlated, but not deterministically
+
+Low events → almost always clonal
+
+Very high events → often subclonal
+
+But: some very high-event tumours remain **clonally fixed**
+
+```{r}
+
+pat_gene_clon <- left_join(pat_clonality_all_filtpc, patient_clonality, by = "hmfPatientId")
+```
+
+```{r}
+
+```
+
+```{r}
+ggplot(pat_gene_clon,
+       aes(x = gene, y = prop_subclonal)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.1, alpha = 0.5) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+patient_level <- pat_gene_clon %>%
+  distinct(hmfPatientId, prop_subclonal, n_events_total, tumorPurity, residual_subclonality)
+
+ggplot(pat_gene_clon, aes(x = patient_rank, y = prop_subclonal)) +
+  geom_point(alpha = 0.8) +
+  geom_line(alpha = 0.5) +
+  theme_classic() +
+  labs(
+    x = "Patients ranked by subclonality",
+    y = "Proportion subclonal",
+    title = "Patient-wise tumour subclonality spectrum"
+  )
+```
+
+```{r}
+ggplot(pat_gene_clon, aes(x = tumorPurity, y = prop_subclonal)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_classic() +
+  labs(
+    x = "Tumour purity",
+    y = "Proportion subclonal",
+   title = "Relationship between tumour purity and subclonality"
+  )
+```
+
+```         
+```

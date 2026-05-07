@@ -1,0 +1,500 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+
+```
+
+We've established that the strongest transcriptional signal (HRD vs HRP) comes from chemokines, but as this is closely correlated with tumour purity it is clearly coming from the tumour microenvironment.
+
+The tumour -intrinsic signal is thus likely weak. So we need to design a new DE-GSEA analysis where we control for microenvironmental factors and work only with high purity samples.
+
+```{r}
+## design
+design <- model.matrix(~ tumorPurity + score_stroma + score_blood + HRD_status, 
+                       data = meta_unique_rna_all)
+
+## high purity
+dat_high <- meta_unique_rna_all %>% filter(tumorPurity > 0.6)
+```
+
+```{r}
+DNAvsRNA_ti <- function(pats = NULL,            # optional: user-supplied altered patients
+                     gene,
+                     counts,
+                     pws,
+                     metadata,              # NEW: must contain id_col + purity_col
+                     id_col     = "patientID",
+                     purity_col = "tumorPurity",
+                     use_cnv = FALSE,        # TRUE to also include CNV deletions
+                     purity_df = 3,          # 1 = linear purity, >1 spline
+                     logFC_cutoff = 1.5,
+                     fdr_cutoff   = 0.01,
+                     top_n        = 20,
+                     minSize      = 15,
+                     maxSize      = 500,
+                     run_ssgsea   = TRUE,    # NEW
+                     ssgsea_alpha = 0.25,    # NEW
+                     ssgsea_norm  = TRUE     # NEW
+) {
+  
+  ## 0. Basic checks
+  if (length(gene) != 1) stop("DNAvsRNA() only accepts a single gene symbol.")
+  if (missing(pws) || is.null(pws)) stop("Please provide a named list of pathways in 'pws'.")
+  if (!is.list(pws) || is.null(names(pws))) stop("pws must be a *named list*.")
+  if (missing(metadata) || is.null(metadata)) stop("Please provide 'metadata' with tumour purity.")
+  if (!all(c(id_col, purity_col) %in% names(metadata)))
+    stop("metadata must contain columns: ", paste(c(id_col, purity_col), collapse = ", "))
+  
+  ## 1. Choose altered patients
+  if (is.null(pats)) {
+    mut_pats <- get_mut_pats(gene)
+    message("Using get_mut_pats(): ", length(mut_pats), " altered patients for ", gene)
+  } else {
+    mut_pats <- as.character(pats)
+    message("Using user-supplied pats: ", length(mut_pats), " altered patients")
+  }
+  
+  ## 2. Optionally add CNV-deleted patients
+  if (use_cnv) {
+    cnv_df   <- getCNV(gene, "DEL")
+    cnv_pats <- unique(cnv_df$patientID)
+    message("Adding ", length(cnv_pats), " CNV-del patients")
+    mut_pats <- unique(c(mut_pats, cnv_pats))
+  }
+  
+  ## 3. Define universe + groups
+  all_pats <- colnames(counts)
+  mut_pats <- intersect(mut_pats, all_pats)
+  if (length(mut_pats) == 0) stop("No altered patients found in counts after matching IDs.")
+  
+  NON_mut_pats <- setdiff(all_pats, mut_pats)
+  if (length(NON_mut_pats) == 0) stop("No non-altered patients left (NON_mut_pats empty).")
+  
+  message("Performing DE for ",
+          length(mut_pats), " Alt vs ",
+          length(NON_mut_pats), " WT patients")
+  
+  # Subset counts (genes x samples)
+  count_df <- counts[, c(mut_pats, NON_mut_pats), drop = FALSE]
+  
+  # Group labels aligned to columns
+  group <- factor(c(rep("T", length(mut_pats)),
+                    rep("C", length(NON_mut_pats))))
+  sample_ids <- colnames(count_df)
+  
+  # ---- Build sample_info aligned to count_df columns ----
+  sample_info <- metadata[match(sample_ids, metadata[[id_col]]), , drop = FALSE]
+  if (anyNA(sample_info[[id_col]])) {
+    bad <- sample_ids[is.na(sample_info[[id_col]])]
+    stop("These samples are missing from metadata (", id_col, "): ", paste(bad, collapse = ", "))
+  }
+  
+  purity <- sample_info[[purity_col]]
+  if (!is.numeric(purity)) stop(purity_col, " must be numeric in [0,1].")
+  purity <- pmin(pmax(purity, 0), 1)
+  sample_info$purity <- purity
+  sample_info$group  <- group
+  
+  # ---- Purity-adjusted design for DE ----
+  if (purity_df > 1) {
+    design <- model.matrix(~ splines::ns(purity, df = purity_df) + group, data = sample_info)
+  } else {
+    design <- model.matrix(~ purity + group + score_stroma + score_blood, data = sample_info)
+  }
+  
+  ## 4. edgeR DE (purity-adjusted)
+  dge <- edgeR::DGEList(counts = count_df)
+  keep <- edgeR::filterByExpr(dge, group = group)
+  dge <- dge[keep, , keep.lib.sizes = FALSE]
+  dge  <- edgeR::calcNormFactors(dge)
+  ## exact normalised counts
+  logCPM <- edgeR::cpm(dge, log = TRUE)
+  
+  message("Estimating dispersion")
+  dge <- edgeR::estimateDisp(dge, design)
+  fit <- edgeR::glmQLFit(dge, design)
+  qlf <- edgeR::glmQLFTest(fit, coef = "groupT")
+  
+  DE  <- edgeR::topTags(qlf, n = nrow(dge$counts))
+  res <- DE$table
+  
+  ## 5. Volcano plot
+  res$gene   <- rownames(res)
+  res$logFDR <- -log10(res$FDR)
+  
+  res$Significant <- "NS"
+  res$Significant[res$logFC >  logFC_cutoff & res$FDR < fdr_cutoff] <- "Up"
+  res$Significant[res$logFC < -logFC_cutoff & res$FDR < fdr_cutoff] <- "Down"
+  
+  sig_hits <- res[res$Significant != "NS", , drop = FALSE]
+  
+  Volcano <- ggplot2::ggplot(res, ggplot2::aes(x = logFC, y = logFDR)) +
+    ggplot2::geom_point(ggplot2::aes(color = Significant), alpha = 0.6) +
+    ggplot2::geom_hline(yintercept = -log10(fdr_cutoff),
+                        linetype = "dashed", color = "black") +
+    ggplot2::geom_vline(xintercept = c(-logFC_cutoff, logFC_cutoff),
+                        linetype = "dotted", color = "black") +
+    ggplot2::scale_color_manual(values = c("Up"="#b2182b","Down"="#2166ac","NS"="#bdbdbd")) +
+    ggrepel::geom_text_repel(
+      data = sig_hits,
+      ggplot2::aes(label = gene),
+      max.overlaps = 30,
+      size = 3,
+      box.padding = 0.3,
+      point.padding = 0.2,
+      segment.color = "grey50"
+    ) +
+    ggplot2::labs(
+      title = paste("Purity-adjusted DE:", length(mut_pats), "Alt vs WT for", gene),
+      x = "Log2 Fold Change (Alt vs WT)",
+      y = "-Log10 FDR"
+    ) +
+    ggplot2::theme_minimal()
+  
+  ## 6. Ranked list for fgsea (purity-adjusted because logFC is)
+  gene_list <- res$logFC
+  names(gene_list) <- rownames(res)
+  gene_list <- sort(gene_list, decreasing = TRUE)
+  gene_list_names <- names(gene_list)
+  
+  # Debug: pathway sizes & overlaps
+  path_sizes   <- sapply(pws, length)
+  path_overlap <- sapply(pws, function(g) length(intersect(gene_list_names, g)))
+  
+  fgseaRes <- fgsea::fgseaMultilevel(
+    pathways = pws,
+    stats    = gene_list,
+    minSize  = minSize,
+    maxSize  = maxSize
+  )
+  fgseaRes_df <- as.data.frame(fgseaRes)
+  
+  topPathways_df <- fgseaRes_df
+  GSEA_plot <- NULL
+  
+  if (nrow(fgseaRes_df) > 0) {
+    top_n2 <- min(top_n, nrow(fgseaRes_df))
+    topPathways_df <- fgseaRes_df[order(fgseaRes_df$padj), ][1:top_n2, , drop = FALSE]
+    
+    topPathways_df$signif <- ifelse(topPathways_df$padj < fdr_cutoff, "Significant", "Not significant")
+    topPathways_df$direction <- ifelse(topPathways_df$NES >= 0, "Up", "Down")
+    topPathways_df$cat <- factor(
+      paste(topPathways_df$direction, topPathways_df$signif, sep = "_"),
+      levels = c("Up_Significant","Up_Not significant","Down_Significant","Down_Not significant")
+    )
+    
+    GSEA_plot <- ggplot2::ggplot(topPathways_df,
+                                 ggplot2::aes(x = reorder(pathway, NES), y = NES, fill = cat)) +
+      ggplot2::geom_col() +
+      ggplot2::coord_flip() +
+      ggplot2::labs(
+        x = "Pathway",
+        y = "NES",
+        title = paste("Purity-adjusted pre-ranked fgsea for", gene, "(Alt vs WT)")
+      ) +
+      ggplot2::scale_fill_manual(
+        values = c("Up_Significant"="#b2182b","Up_Not significant"="#f4a582",
+                   "Down_Significant"="#2166ac","Down_Not significant"="#92c5de"),
+        labels = c("Up_Significant"="Up (padj<0.05)","Up_Not significant"="Up (NS)",
+                   "Down_Significant"="Down (padj<0.05)","Down_Not significant"="Down (NS)")
+      ) +
+      ggplot2::theme_minimal(base_size = 12) +
+      ggplot2::theme(
+        legend.title       = ggplot2::element_blank(),
+        panel.grid.minor   = ggplot2::element_blank(),
+        panel.grid.major.y = ggplot2::element_blank()
+      )
+  } else {
+    warning("fgsea returned no pathways (likely low overlap or minSize too high).")
+  }
+  
+  ## 7. ssGSEA (compute scores) + purity-adjusted Alt vs WT on scores
+  ssgsea_scores <- ssgsea_de <- ssgsea_plot <- NULL
+  
+  if (run_ssgsea) {
+    # log1p-CPM for ssGSEA (TMM), using the same samples
+    y <- edgeR::DGEList(count_df)
+    y <- edgeR::calcNormFactors(y, method = "TMM")
+    expr_for_ssgsea <- log1p(edgeR::cpm(y, log = FALSE))  # genes x samples
+    
+    # ssGSEA
+    par_ssgsea <- GSVA::ssgseaParam(
+      exprData  = expr_for_ssgsea,
+      geneSets  = pws,
+      minSize   = 5,
+      maxSize   = 5000,
+      alpha     = ssgsea_alpha,
+      normalize = ssgsea_norm
+    )
+    ssgsea_scores <- GSVA::gsva(par_ssgsea, verbose = FALSE)  # pathways x samples
+    
+    # Purity-adjusted model on pathway scores
+    if (purity_df > 1) {
+      design_ss <- model.matrix(~ splines::ns(purity, df = purity_df) + group, data = sample_info)
+    } else {
+      design_ss <- model.matrix(~ purity + group, data = sample_info)
+    }
+    
+    fit_ss <- limma::lmFit(ssgsea_scores, design_ss)
+    fit_ss <- limma::eBayes(fit_ss)
+    
+    ssgsea_de <- limma::topTable(fit_ss, coef = "groupT", number = Inf, sort.by = "P")
+    ssgsea_de$pathway <- rownames(ssgsea_de)
+    
+    # Simple plot: top pathways by p-value (t-stat direction)
+    top_show <- head(ssgsea_de, min(top_n, nrow(ssgsea_de)))
+    ssgsea_plot <- ggplot2::ggplot(top_show,
+                                   ggplot2::aes(x = reorder(pathway, t), y = t)) +
+      ggplot2::geom_col(fill = "#1F77B4") +
+      ggplot2::coord_flip() +
+      ggplot2::labs(
+        x = "Pathway",
+        y = "t-stat (Alt vs WT, purity-adjusted)",
+        title = "ssGSEA pathway differences (purity-adjusted Alt vs WT)"
+      ) +
+      ggplot2::theme_minimal(base_size = 12)
+  }
+  
+  ## 8. Return everything
+  list(
+    gene            = gene,
+    mut_pats        = mut_pats,
+    NON_mut_pats    = NON_mut_pats,
+    sample_info     = sample_info,
+    logCPM          = logCPM,
+    DE_res          = res,
+    Vol             = Volcano,
+    GSEA            = topPathways_df,
+    GSEA_plot       = GSEA_plot,
+    pathway_sizes   = path_sizes,
+    pathway_overlap = path_overlap,
+    ssgsea_scores   = ssgsea_scores,
+    ssgsea_de       = ssgsea_de,
+    ssgsea_plot     = ssgsea_plot
+  )
+}
+```
+
+```{r}
+HR_DE_GSEA <- DNAvsRNA(pats = hr_def_pats,  
+                      gene = "HR",
+                      counts = counts,
+                      pws = pws,
+                      metadata = meta_high_purity, 
+                      id_col     = "hmfPatientId",
+                      purity_col = "tumorPurity",
+                      use_cnv = FALSE,        # TRUE to also include CNV deletions
+                      purity_df = 3,          # 1 = linear purity, >1 spline
+                      logFC_cutoff = 1.5,
+                      fdr_cutoff   = 0.01,
+                      top_n        = 30,
+                      minSize      = 15,
+                      maxSize      = 500,
+                      run_ssgsea   = TRUE,    # NEW
+                      ssgsea_alpha = 0.25,    # NEW
+                      ssgsea_norm  = TRUE     # NEW
+)
+```
+
+```{r}
+high_purity_pats <- dat_high$hmfPatientId
+high_purity_HRDpats <- hr_def_pats[hr_def_pats %in% high_purity_pats]
+high_purity_counts <- counts[, colnames(counts) %in% high_purity_pats]
+meta_high_purity <- meta_unique_rna_all[meta_unique_rna_all$hmfPatientId %in% 
+                                          high_purity_pats, ]
+## tumour intrinsic (ti)
+HR_DE_GSEA_ti <- DNAvsRNA(pats = high_purity_HRDpats,  
+                      gene = "HR",
+                      counts = high_purity_counts,
+                      pws = pws,
+                      metadata = meta_high_purity, 
+                      id_col     = "hmfPatientId",
+                      purity_col = "tumorPurity",
+                      use_cnv = FALSE,        # TRUE to also include CNV deletions
+                      purity_df = 3,          # 1 = linear purity, >1 spline
+                      logFC_cutoff = 1.5,
+                      fdr_cutoff   = 0.01,
+                      top_n        = 30,
+                      minSize      = 15,
+                      maxSize      = 500,
+                      run_ssgsea   = TRUE,    # NEW
+                      ssgsea_alpha = 0.25,    # NEW
+                      ssgsea_norm  = TRUE     # NEW
+)
+```
+
+![](images/clipboard-881154408.png)
+
+```{r}
+## RB1 loss still comes out top
+# RB1
+RB1_loss_up_LE_hp <- unlist(HR_DE_GSEA_ti$GSEA[1,8])
+
+meta_high_purity$RB1_loss_score <- score_panel(HR_DE_GSEA_ti$logCPM, RB1_loss_up_LE_hp )[meta_high_purity$hmfPatientId]
+
+meta_high_purity <- meta_high_purity %>%
+  mutate(
+    HRD_status = if_else(hmfPatientId %in% hr_def_pats, "HRD", "HRP"),
+    HRD_status = factor(HRD_status, levels = c("HRP", "HRD"))
+  )
+
+library(ggpubr)
+
+
+```
+
+```{r}
+ggplot(meta_high_purity, aes(HRD_status, score_senescence, fill = HRD_status)) +
+  geom_point(alpha = 0.6) +
+  geom_boxplot() +
+  stat_compare_means(method = "wilcox.test") +
+  theme_bw()
+```
+
+```{r}
+### next I need to see if this signal is associated with treatment...
+
+ggplot(meta_high_purity, aes(tx_class, RB1_loss_score, fill = tx_class)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+ggplot(meta_unique_rna_all, aes(x = tx_class, fill = HRD_status)) +
+  geom_bar(position = "dodge") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "Count")
+```
+
+```{r}
+ggplot(meta_unique_rna_all, aes(x = tx_class, fill = HRD_status)) +
+  geom_bar(position = "fill") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(y = "Proportion", x = NULL)
+```
+
+```{r}
+ggplot(meta_unique_rna_all, aes(x = tx_class, fill = HRD_status)) +
+  geom_bar(aes(y = after_stat(prop), group = HRD_status),
+           position = "dodge") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(y = "Proportion", x = NULL).
+```
+
+```{r}
+#### it seems clear that HRD is associated with an RB-loss transcriptional phenotype so the next question is, how much of this can be explained by the loss of TP53?
+
+drivers_TP53 <- drivers_allIDs[drivers_allIDs$gene == "TP53", ] 
+TP53_pats <- unique(drivers_TP53$hmfPatientId)
+
+library(dplyr)
+
+meta_high_purity <- meta_high_purity %>%
+  mutate(
+    TP53_status = if_else(hmfPatientId %in% TP53_pats, "alt", "wt"),
+    TP53_status = factor(TP53_status, levels = c("wt", "alt"))
+  )
+
+ggplot(meta_high_purity, aes(TP53_status, RB1_loss_score, fill = TP53_status)) +
+  geom_point(alpha = 0.6) +
+  geom_boxplot() +
+  stat_compare_means(method = "wilcox.test") +
+  theme_bw()
+```
+
+```{r}
+## there are more or less equal numberd of TP53 alt and wt patients in the HRD group, so what happens if we plot RB1_loss vs TP53 status just for those patients?
+
+meta_HRD_highpur <- meta_high_purity[meta_high_purity$HRD_status == "HRD", ]
+
+ggplot(meta_HRD_highpur, aes(TP53_status, RB1_loss_score, fill = TP53_status)) +
+  geom_point(alpha = 0.6) +
+  geom_boxplot() +
+  stat_compare_means(method = "wilcox.test") +
+  theme_bw()
+```
+
+```{r}
+design <- model.matrix(~ HRD_status * TP53_status + tx_class + tumorPurity, data = meta_high_purity)
+fit <- limma::lmFit(HR_DE_GSEA_ti$logCPM, design)
+fit <- limma::eBayes(fit)
+```
+
+```{r}
+## genes with an HRD effect after adjusting for TP53
+library(limma)
+
+res_hrd <- topTable(
+  fit,
+  coef = "HRD_statusHRD",
+  number = Inf,
+  sort.by = "P"
+)
+
+res_hrd$gene <- rownames(res_hrd)
+head(res_hrd)
+```
+
+```{r}
+res_int <- topTable(
+  fit,
+  coef = "HRD_statusHRD:TP53_statusalt",
+  number = Inf,
+  sort.by = "P"
+)
+
+res_int$gene <- rownames(res_int)
+head(res_int)
+```
+
+```{r}
+## let's try running a differential analysis between TP53 alt and wt in HRD patients
+
+HRD_hp_counts <- counts[, colnames(counts) %in% high_purity_HRDpats]
+HRD_TP53wt_hp <- meta_HRD_highpur[meta_HRD_highpur$TP53_status == "alt", ]
+HRD_TP53wt_hp_pats <- unique(HRD_TP53wt_hp$hmfPatientId)
+
+HR_DE_GSEA_ti_TP53 <- DNAvsRNA(pats = HRD_TP53wt_hp_pats,  
+                      gene = "HR",
+                      counts = HRD_hp_counts,
+                      pws = pws,
+                      metadata = meta_high_purity, 
+                      id_col     = "hmfPatientId",
+                      purity_col = "tumorPurity",
+                      use_cnv = FALSE,        # TRUE to also include CNV deletions
+                      purity_df = 3,          # 1 = linear purity, >1 spline
+                      logFC_cutoff = 1.5,
+                      fdr_cutoff   = 0.01,
+                      top_n        = 30,
+                      minSize      = 15,
+                      maxSize      = 500,
+                      run_ssgsea   = TRUE,    # NEW
+                      ssgsea_alpha = 0.25,    # NEW
+                      ssgsea_norm  = TRUE     # NEW
+)
+```
+
+```{r}
+HR_DE_ti_TP53 <- HR_DE_GSEA_ti_TP53$DE_res
+```
+
+```{r}
+## conclusion: HRD does not define a separate transcriptional state — it defines a subtype within a TP53/RB-like proliferative state
+```
